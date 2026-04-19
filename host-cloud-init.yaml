@@ -1,0 +1,107 @@
+#cloud-config
+# BinaryLane first-boot for Ubuntu 24.04 Incus host.
+# Paste into the "User Data / Cloud-Init" field during VPS rebuild.
+# REPLACE <YOUR_SSH_PUBKEY> below before deploying.
+
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+
+packages:
+  - incus
+  - qemu-system
+  - tmux
+  - ufw
+  - fail2ban
+  - git
+  - curl
+  - jq
+  - ripgrep
+  - acl
+  - ca-certificates
+
+users:
+  - default
+  - name: ops
+    gecos: Operations user
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - <YOUR_SSH_PUBKEY>
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    permissions: '0644'
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+      PubkeyAuthentication yes
+      AuthenticationMethods publickey
+      AllowUsers ops
+      X11Forwarding no
+      AllowAgentForwarding no
+      AllowTcpForwarding yes
+      MaxAuthTries 3
+      LoginGraceTime 20
+      ClientAliveInterval 30
+      ClientAliveCountMax 4
+      DebianBanner no
+
+  - path: /etc/sysctl.d/99-incus-ai.conf
+    permissions: '0644'
+    content: |
+      fs.inotify.max_user_watches=1048576
+      fs.inotify.max_user_instances=1048576
+      fs.inotify.max_queued_events=1048576
+      kernel.dmesg_restrict=1
+
+  - path: /etc/fail2ban/jail.d/sshd.local
+    permissions: '0644'
+    content: |
+      [sshd]
+      enabled = true
+      backend = systemd
+      port = 22
+      findtime = 10m
+      maxretry = 5
+      bantime = 1h
+
+runcmd:
+  # Add root subuid/subgid range BEFORE Incus ever starts a container.
+  # Incus uses this range to map unprivileged container UIDs.
+  - [sh, -c, "grep -q '^root:1000000:' /etc/subuid || echo 'root:1000000:1000000000' >> /etc/subuid"]
+  - [sh, -c, "grep -q '^root:1000000:' /etc/subgid || echo 'root:1000000:1000000000' >> /etc/subgid"]
+
+  # Add ops to incus-admin AFTER the incus package created the group.
+  - usermod -aG incus-admin ops
+
+  # Apply sysctl tuning (inotify limits for file watchers / LSPs in containers).
+  - sysctl --system
+
+  # Harden SSH.
+  - sshd -t
+  - systemctl restart ssh
+
+  # UFW: deny by default, allow SSH, trust the Incus bridge that bootstrap.sh will create.
+  # These rules apply as soon as incusbr0 exists — UFW stores rules by interface name.
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw default deny routed
+  - ufw allow 22/tcp
+  - ufw allow in on incusbr0
+  - ufw allow out on incusbr0
+  - ufw route allow in on incusbr0
+  - ufw route allow out on incusbr0
+  - sh -c "yes | ufw enable"
+
+  # Intrusion protection.
+  - systemctl enable --now fail2ban
+
+  # Incus daemon ready for bootstrap.sh.
+  - systemctl enable --now incus
+
+final_message: "Host first-boot complete. SSH in as ops, then run bootstrap.sh."
