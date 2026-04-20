@@ -1,7 +1,7 @@
 # incus-ai-agents
 
-Bootstrap a cloud Ubuntu 24.04 VPS as an Incus host running two AI coding
-agent containers. Each container is a blank Ubuntu 24.04 with:
+Bootstrap a cloud Ubuntu 24.04 VPS as an Incus host running any number of AI
+coding agent containers. Each container is a blank Ubuntu 24.04 with:
 
 - SSH, tmux (mouse + OSC 52 clipboard), git, Doppler CLI
 - Auto-generated ed25519 key ready to add to GitHub
@@ -13,9 +13,9 @@ not baked in — keeps rebuilds fast and lets you pick per container.
 ## Files
 
 - `host-cloud-init.yaml` — VPS first-boot (paste into cloud-init User Data)
-- `bootstrap.sh` — Post-login Incus setup on the host
-- `export-golden.sh` — Snapshot + export both containers as known-good tarballs
-- `restore-golden.sh` — Recreate both containers from golden tarballs
+- `bootstrap.sh` — Interactive post-login Incus setup on the host
+- `export-golden.sh` — Snapshot + export every agent container as tarballs
+- `restore-golden.sh` — Recreate containers from golden tarballs
 
 ## First-time setup
 
@@ -28,10 +28,48 @@ not baked in — keeps rebuilds fast and lets you pick per container.
    ```bash
    scp bootstrap.sh ops@<vps>:~/
    ssh ops@<vps>
-   GIT_USER_NAME="Alpha Agent" GIT_USER_EMAIL="you+alpha@example.com" \
-   DOPPLER_TOKEN_ALPHA=... DOPPLER_TOKEN_BETA=... \
-     ./bootstrap.sh
+   ./bootstrap.sh
    ```
+   The script will prompt for:
+   - **Number of VMs** (default: 2)
+   - **VM names** (default: Greek alphabet in order — `alpha beta gamma …`)
+   - **RAM per VM in GiB** — default is an equal split of host RAM minus a
+     2 GiB reserve for the host itself
+   - **Git user.name / user.email** baked into each container (optional)
+   - **Doppler service token per VM** (optional)
+
+   It then prints a plan and asks to confirm before building anything.
+   IPs are auto-allocated on the `10.88.0.0/24` bridge starting at
+   `10.88.0.11` (one per VM).
+
+### Non-interactive / scripted runs
+
+Every prompt has a matching env var, so you can skip the prompts entirely:
+
+```bash
+VM_COUNT=3 \
+VM_NAMES="alpha beta gamma" \
+VM_RAM="6 4 4" \
+GIT_USER_NAME="Agent" GIT_USER_EMAIL="you@example.com" \
+DOPPLER_TOKEN_ALPHA=... DOPPLER_TOKEN_BETA=... DOPPLER_TOKEN_GAMMA=... \
+ASSUME_YES=1 \
+  ./bootstrap.sh
+```
+
+Env vars:
+
+| Var | Default | Notes |
+|---|---|---|
+| `VM_COUNT` | `2` | Number of VMs. |
+| `VM_NAMES` | `alpha beta gamma …` | Space-separated names; must match `VM_COUNT`. Greek alphabet in order; falls back to `vm25 vm26 …` past 24. |
+| `VM_RAM` | equal split | Space-separated GiB integers, same order as `VM_NAMES`. |
+| `HOST_RESERVE_GB` | `2` | GiB kept for the host when computing default split. |
+| `IP_BASE` | `11` | Last octet of first VM's IP on `incusbr0`. |
+| `GIT_USER_NAME` / `GIT_USER_EMAIL` | unset | Baked into `~/.gitconfig` inside each container. |
+| `DOPPLER_TOKEN_<NAME>` | unset | Per-VM service token. `<NAME>` is the VM name uppercased, hyphens replaced with underscores (e.g. `vm-1` → `DOPPLER_TOKEN_VM_1`). |
+| `DOPPLER_TOKEN_<NAME>_FILE` | unset | Alternative: path to a file containing the token. Preferred over the env-var form for scripted runs — keeps the secret out of shell history and `/proc/<pid>/environ`. |
+| `ASSUME_YES` | `0` | Set to `1` to skip the final confirmation prompt. |
+
 4. **Add each container's GitHub SSH key** (printed at the end of
    `bootstrap.sh`) to your GitHub account.
 5. **Install agent CLIs** in each container as needed. Examples:
@@ -50,14 +88,71 @@ not baked in — keeps rebuilds fast and lets you pick per container.
    npm install -g @openai/codex
    ```
 
+## Doppler service tokens: persistence & security
+
+### Where the token lives
+
+Once injected, the token is written inside the container to
+`/home/agent/.doppler/.doppler.yaml` (mode `0600`, owned by `agent`). From
+that point on, `doppler run -- <cmd>` and friends pick it up automatically
+for the `agent` user.
+
+Persistence across events:
+
+| Event | Token survives? |
+|---|---|
+| Container restart / reboot | Yes (part of the container filesystem) |
+| Host VPS reboot | Yes |
+| Re-running `bootstrap.sh` on an existing container | Yes (not touched unless you pass a new token) |
+| Destroying & recreating the container | **No** — re-inject |
+| Full VPS rebuild from scratch | **No** — re-inject |
+| Restore from a golden tarball captured *after* injection | Yes |
+
+So the durable pattern for disaster recovery is: inject once, then
+`./export-golden.sh`. A future `restore-golden.sh` on a fresh VPS brings
+the tokens back with the container — no re-entry needed.
+
+### How the token is kept out of logs & history
+
+- The interactive prompt uses silent read — pasted tokens don't echo to
+  your terminal or scrollback.
+- Injection pipes the token over stdin through `incus exec` → `sudo` →
+  `doppler configure set token`. The token never appears in:
+  - `ps` output on the host
+  - your host shell's history
+  - the container's `/var/log/auth.log` (sudo only logs the command, which
+    doesn't contain the secret)
+- The resulting config file inside the container is `0600` and only
+  readable by `agent` (and root). The container is not reachable from the
+  public internet — only from the host via `incusbr0`.
+
+### Feeding tokens to a scripted run
+
+For non-interactive bootstraps, prefer the `_FILE` form over inlining the
+token in the environment. That keeps it out of shell history and out of
+`/proc/<pid>/environ`:
+
+```bash
+install -m 600 /dev/stdin /root/alpha.token <<< 'dp.st.prod.xxxxx'
+install -m 600 /dev/stdin /root/beta.token  <<< 'dp.st.prod.yyyyy'
+
+DOPPLER_TOKEN_ALPHA_FILE=/root/alpha.token \
+DOPPLER_TOKEN_BETA_FILE=/root/beta.token  \
+ASSUME_YES=1 \
+  ./bootstrap.sh
+
+shred -u /root/*.token   # once you've confirmed the containers are healthy
+```
+
 ## Capturing a known-good state
 
 Once everything is configured the way you like, capture golden exports:
 ```bash
-./export-golden.sh
+./export-golden.sh            # all containers with the agent-base profile
+./export-golden.sh alpha beta # or a specific subset
 ```
 This writes timestamped tarballs to `/srv/incus-exports/` and points
-`{alpha,beta}-golden.tar.gz` symlinks at the latest.
+`<name>-golden.tar.gz` symlinks at the latest.
 
 Copy the tarballs off-box (e.g. iCloud, S3, another VPS) for disaster recovery.
 
@@ -65,17 +160,20 @@ Copy the tarballs off-box (e.g. iCloud, S3, another VPS) for disaster recovery.
 
 1. Rebuild VPS (same `host-cloud-init.yaml` flow).
 2. Copy your golden tarballs back to `/srv/incus-exports/`.
-3. Run `bootstrap.sh` to set up Incus (skip — it'll stop early if containers
-   already exist, but the initial Incus init is needed). Alternative: extract
-   just the `incus admin init --preseed` block and run that.
-4. Run `./restore-golden.sh`.
+3. Run `bootstrap.sh` once to initialise Incus. If the containers already
+   exist from the tarballs, it'll skip recreating them; if you'd rather
+   just do the Incus init step, extract the `incus admin init --preseed`
+   block and run that.
+4. Run `./restore-golden.sh` (or pass specific names).
 
-## Container IPs
+## Network
 
-- alpha: `10.88.0.11`
-- beta: `10.88.0.12`
+- Bridge: `incusbr0` (`10.88.0.0/24`)
+- IPs are assigned in order: `10.88.0.11`, `10.88.0.12`, … (override with `IP_BASE`)
+- UFW trusts the `incusbr0` bridge; containers can't be reached from the
+  public internet, only via the host.
 
-Suggested `~/.ssh/config` on your Mac:
+Suggested `~/.ssh/config` on your client (adjust names/IPs to what you chose):
 ```
 Host bl-host
   HostName <your-vps-ip>
@@ -94,8 +192,6 @@ Host beta
 
 ## Notes
 
-- Snapshots are taken daily and expire after 7 days (configured in the
+- Snapshots are taken daily and expire after 7 days (configured in each
   per-container profile).
-- UFW trusts the `incusbr0` bridge; containers can't be reached from the
-  public internet, only via the host.
 - The host cloud-init hardens SSH (pubkey-only, no root login, `ops`-only).
