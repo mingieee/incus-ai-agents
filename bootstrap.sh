@@ -283,6 +283,36 @@ if [ "$TOTAL_REQUESTED" -gt "$AVAILABLE_GB" ]; then
   fi
 fi
 
+# -------- Doppler tokens per VM (optional) --------
+# Asked before git identity because a Doppler token that resolves a
+# GITHUB_TOKEN secret gives us two downstream automations: (1) bootstrap
+# uploads the container's SSH key to GitHub via gh, and (2) we could
+# pre-fill the git email from the GitHub account if the operator wants.
+#
+# Tokens are read with no-echo so pasted values don't land on screen /
+# scrollback, and injected via stdin (not command args) so they don't
+# appear in ps / sudo logs. An alternative to env vars:
+# DOPPLER_TOKEN_<NAME>_FILE=/path/to/token (one token per file, chmod 600).
+# Useful for scripted runs without putting the secret in shell history or
+# the environment.
+declare -A DOPPLER_TOKENS=()
+echo
+echo "Doppler service tokens (Enter to skip per VM; input is hidden):"
+for name in "${VM_NAME_ARR[@]}"; do
+  envvar="DOPPLER_TOKEN_$(env_suffix "$name")"
+  filevar="${envvar}_FILE"
+  token=""
+  if [ -n "${!filevar-}" ]; then
+    [ -r "${!filevar}" ] || { echo "ERROR: $filevar=${!filevar} not readable"; exit 1; }
+    token="$(tr -d '\r\n' < "${!filevar}")"
+  elif [ "${!envvar-__UNSET__}" != "__UNSET__" ]; then
+    token="${!envvar}"
+  else
+    token="$(prompt_secret "  Doppler token for $name")"
+  fi
+  DOPPLER_TOKENS[$name]="$token"
+done
+
 # -------- Git identity (optional, per-VM via plus-addressing) --------
 # One base email (e.g. you@example.com) gets expanded per VM using
 # plus-addressing: `you+alpha@example.com`, `you+beta@example.com`, etc.
@@ -316,30 +346,6 @@ if [ -n "$GIT_USER_EMAIL_BASE" ]; then
     fi
   done
 fi
-
-# -------- Doppler tokens per VM (optional) --------
-# Tokens are read with no-echo so pasted values don't land on screen / scrollback,
-# and injected via stdin (not command args) so they don't appear in ps / sudo logs.
-# An alternative to env vars: DOPPLER_TOKEN_<NAME>_FILE=/path/to/token (one
-# token per file, chmod 600). Useful for scripted runs without putting the
-# secret in shell history or the environment.
-declare -A DOPPLER_TOKENS=()
-echo
-echo "Doppler service tokens (Enter to skip per VM; input is hidden):"
-for name in "${VM_NAME_ARR[@]}"; do
-  envvar="DOPPLER_TOKEN_$(env_suffix "$name")"
-  filevar="${envvar}_FILE"
-  token=""
-  if [ -n "${!filevar-}" ]; then
-    [ -r "${!filevar}" ] || { echo "ERROR: $filevar=${!filevar} not readable"; exit 1; }
-    token="$(tr -d '\r\n' < "${!filevar}")"
-  elif [ "${!envvar-__UNSET__}" != "__UNSET__" ]; then
-    token="${!envvar}"
-  else
-    token="$(prompt_secret "  Doppler token for $name")"
-  fi
-  DOPPLER_TOKENS[$name]="$token"
-done
 
 # -------- IP allocation --------
 IP_BASE="${IP_BASE:-$DEFAULT_IP_BASE}"
