@@ -975,20 +975,24 @@ runcmd:
   - systemctl daemon-reload
   - systemctl enable --now agent-tmux.service
   # Doppler CLI — apt repo, keyring fetched directly from vendor (avoids
-  # unreliable keyserver.ubuntu.com). Post-bootstrap, the host pipes the
-  # service token via stdin into `doppler configure set token`.
-  - bash -c 'for i in 1 2 3; do curl -fsSL https://packages.doppler.com/public/cli/gpg.key | gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg && break; sleep 5; done'
+  # unreliable keyserver.ubuntu.com). curl's own --retry handles transient
+  # network failure; pipefail ensures a curl miss propagates through the
+  # pipe to gpg instead of getting masked.
+  - bash -c 'set -eo pipefail; curl -fsSL --retry 3 --retry-delay 5 https://packages.doppler.com/public/cli/gpg.key | gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg'
   - chmod go+r /usr/share/keyrings/doppler-archive-keyring.gpg
   - bash -c 'echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" > /etc/apt/sources.list.d/doppler-cli.list'
   # GitHub CLI — pre-authenticated post-boot by bootstrap.sh if a PAT was
   # resolvable via Doppler. If not, authenticate manually inside the
   # container with:
   #   doppler secrets get ${GITHUB_PAT_SECRET_NAME:-GITHUB_TOKEN} --plain | gh auth login --with-token
-  - bash -c 'for i in 1 2 3; do curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && break; sleep 5; done'
+  - curl -fsSL --retry 3 --retry-delay 5 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
   - chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
   - bash -c 'echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list'
-  # Single update + install for both new repos.
-  - bash -c 'for i in 1 2 3; do apt-get update -qq && break; sleep 5; done'
+  # Single update + install for both new repos. apt-get update has no
+  # built-in retry, so we wrap it in an explicit loop that exits non-zero
+  # after 3 failed attempts rather than hiding the failure behind sleep's
+  # exit status.
+  - bash -c 'for i in 1 2 3; do if apt-get update -qq; then exit 0; fi; if [ "\$i" = "3" ]; then exit 1; fi; sleep 5; done'
   - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq doppler gh
 EOF
 }
