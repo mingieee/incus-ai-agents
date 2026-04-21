@@ -794,6 +794,15 @@ runcmd:
   - chown -R agent:agent /home/agent/.ssh
   - systemctl daemon-reload
   - systemctl enable --now agent-tmux.service
+  # GitHub CLI (for general agent use). Pre-authenticated post-boot by
+  # bootstrap.sh if a PAT was resolvable via Doppler. If not, authenticate
+  # manually inside the container with:
+  #   doppler secrets get ${GITHUB_PAT_SECRET_NAME:-GITHUB_TOKEN} --plain | gh auth login --with-token
+  - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+  - chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+  - bash -c 'echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list'
+  - apt-get update -qq
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh
 EOF
 }
 
@@ -856,6 +865,31 @@ inject_doppler() {
 
 for name in "${VM_NAME_ARR[@]}"; do
   inject_doppler "$name" "${DOPPLER_TOKENS[$name]}"
+done
+
+# -------- Pre-authenticate gh CLI in each container (post-Doppler) --------
+# Pipes the PAT we already resolved for SSH key registration into
+# `gh auth login --with-token` inside the container. After this, the agent
+# user can run `gh` / clone private repos / etc. without interactive auth.
+# PAT is never written to disk as a flag or env var — only to gh's own
+# hosts.yml (mode 0600) after gh persists it.
+inject_gh_auth() {
+  local name="$1" pat="$2"
+  if [ -z "$pat" ]; then
+    return
+  fi
+  echo "==> Authenticating gh CLI in $name"
+  if printf '%s' "$pat" \
+       | incus exec "$name" -- sudo -iu agent bash -c 'gh auth login --with-token && gh config set -h github.com git_protocol ssh' \
+       >/dev/null 2>&1; then
+    echo "  $name: gh authenticated (git_protocol=ssh)"
+  else
+    echo "  $name: gh auth failed — run 'doppler secrets get $GITHUB_PAT_SECRET_NAME --plain | gh auth login --with-token' manually"
+  fi
+}
+
+for name in "${VM_NAME_ARR[@]}"; do
+  inject_gh_auth "$name" "${VM_GITHUB_PATS[$name]:-}"
 done
 
 # GitHub SSH key registration already happened on the host (pre-boot).

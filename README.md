@@ -122,9 +122,19 @@ Once you've given bootstrap a Doppler service token per VM and a `GITHUB_PAT_SEC
 4. The private + public keys are baked into the container's cloud-init so
    the VM wakes up with them in `/home/agent/.ssh/`.
 
-Required PAT scopes: `admin:public_key` (SSH key upload) + `user:email`
-(enumerate verified addresses). Re-runs are idempotent — keys already on
-GitHub are detected, not duplicated.
+Additionally, post-boot, bootstrap pipes the same PAT into the container's
+`gh auth login --with-token` (stdin-only, never on command line), so the
+`agent` user can run `gh`, `gh repo clone`, `gh pr`, etc. without an
+interactive login. `git_protocol` is set to `ssh` so git URLs use the
+SSH keys we just registered.
+
+Required PAT scopes:
+- `admin:public_key` — SSH key upload
+- `user:email` — enumerate verified addresses
+- `repo` (or finer-grained repo perms) — so the pre-authenticated `gh`
+  inside each container can do the work you want it to
+
+Re-runs are idempotent — keys already on GitHub are detected, not duplicated.
 
 ## Doppler service tokens: persistence & security
 
