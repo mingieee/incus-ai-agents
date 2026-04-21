@@ -869,12 +869,11 @@ write_user_data() {
 package_update: true
 package_upgrade: true
 
-apt:
-  sources:
-    doppler:
-      source: "deb [signed-by=\$KEY_FILE] https://packages.doppler.com/public/cli/deb/debian any-version main"
-      keyid: 34A57C7CD1CF2DDA57B3B9D1DE2A7741A397C129
-
+# Doppler and gh are both installed in runcmd (below) rather than listed
+# here — both need an apt repo whose signing key isn't on keyserver.ubuntu.com,
+# and cloud-init's apt.sources keyid fetch is unreliable. Fetching the
+# keyring binary directly from the vendor's CDN (with retries) is far more
+# robust.
 packages:
   - openssh-server
   - tmux
@@ -888,7 +887,6 @@ packages:
   - ca-certificates
   - apt-transport-https
   - gnupg
-  - doppler
 
 users:
   - default
@@ -921,6 +919,7 @@ write_files:
   - path: /home/agent/.tmux.conf
     owner: agent:agent
     permissions: '0644'
+    defer: true
     content: |
       set -g mouse on
       set -g history-limit 100000
@@ -930,17 +929,24 @@ EOF
 
   # Only embed SSH keys if we pre-generated them for this VM (i.e. it's a
   # fresh container). For existing containers we leave their keys alone.
+  # All agent-owned entries use `defer: true` so they run in
+  # write-files-deferred (cloud_final_modules) rather than write-files
+  # (cloud_init_modules) — on Ubuntu 24.04 the non-deferred module runs
+  # BEFORE users-groups, which makes `owner: agent:agent` fail with
+  # "Unknown user or group".
   if [ -n "${VM_SSH_PRIV_B64[$vm]:-}" ]; then
     cat >> "$out" <<EOF
   - path: /home/agent/.ssh/id_ed25519
     owner: agent:agent
     permissions: '0600'
+    defer: true
     encoding: b64
     content: ${VM_SSH_PRIV_B64[$vm]}
 
   - path: /home/agent/.ssh/id_ed25519.pub
     owner: agent:agent
     permissions: '0644'
+    defer: true
     content: |
       ${VM_SSH_PUB[$vm]}
 
@@ -953,6 +959,7 @@ EOF
   - path: /home/agent/.gitconfig
     owner: agent:agent
     permissions: '0644'
+    defer: true
     content: |
 $gitconfig_block
 
@@ -965,19 +972,28 @@ runcmd:
   - systemctl restart ssh
   - mkdir -p /workspace
   - chown agent:agent /workspace
-  - chmod 700 /home/agent/.ssh
-  - chown -R agent:agent /home/agent/.ssh
   - systemctl daemon-reload
   - systemctl enable --now agent-tmux.service
-  # GitHub CLI (for general agent use). Pre-authenticated post-boot by
-  # bootstrap.sh if a PAT was resolvable via Doppler. If not, authenticate
-  # manually inside the container with:
+  # Doppler CLI — apt repo, keyring fetched directly from vendor (avoids
+  # unreliable keyserver.ubuntu.com). curl's own --retry handles transient
+  # network failure; pipefail ensures a curl miss propagates through the
+  # pipe to gpg instead of getting masked.
+  - bash -c 'set -eo pipefail; curl -fsSL --retry 3 --retry-delay 5 https://packages.doppler.com/public/cli/gpg.key | gpg --batch --yes --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg'
+  - chmod go+r /usr/share/keyrings/doppler-archive-keyring.gpg
+  - bash -c 'echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" > /etc/apt/sources.list.d/doppler-cli.list'
+  # GitHub CLI — pre-authenticated post-boot by bootstrap.sh if a PAT was
+  # resolvable via Doppler. If not, authenticate manually inside the
+  # container with:
   #   doppler secrets get ${GITHUB_PAT_SECRET_NAME:-GITHUB_TOKEN} --plain | gh auth login --with-token
-  - bash -c 'for i in 1 2 3; do curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && break; sleep 5; done'
+  - curl -fsSL --retry 3 --retry-delay 5 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
   - chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
   - bash -c 'echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list'
-  - bash -c 'for i in 1 2 3; do apt-get update -qq && break; sleep 5; done'
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh
+  # Single update + install for both new repos. apt-get update has no
+  # built-in retry, so we wrap it in an explicit loop that exits non-zero
+  # after 3 failed attempts rather than hiding the failure behind sleep's
+  # exit status.
+  - bash -c 'for i in 1 2 3; do if apt-get update -qq; then exit 0; fi; if [ "\$i" = "3" ]; then exit 1; fi; sleep 5; done'
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq doppler gh
 EOF
 }
 
