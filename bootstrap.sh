@@ -130,23 +130,37 @@ retry() {
   done
 }
 
+# Write a 0600 curl config file containing the Authorization bearer header
+# for a given token. Caller is responsible for rm'ing the returned path.
+# Prevents tokens from showing up in `ps aux` (they would if passed via -H).
+host_curl_auth_cfg() {
+  local token="$1" cfg
+  cfg="$(mktemp)"
+  chmod 600 "$cfg"
+  printf 'header = "Authorization: Bearer %s"\n' "$token" > "$cfg"
+  echo "$cfg"
+}
+
 # HTTP-aware fetcher: wraps curl so transient failures retry but auth /
 # not-found responses do NOT (no point waiting 6s to confirm a bad PAT).
-# Writes the response body to stdout; returns 0 on 2xx, 1 otherwise.
+# Auth token goes through a curl --config file so it isn't visible in
+# `ps aux` output. Writes response body to stdout; returns 0 on 2xx, 1
+# otherwise.
 host_http_get() {
-  local url="$1" ; shift  # remaining args are extra curl options (e.g. headers)
-  local attempts=3 delay=2 n=0 body status
-  local tmpbody
+  local url="$1" token="$2" ; shift 2   # extra curl opts come after
+  local attempts=3 delay=2 n=0 status
+  local tmpbody authcfg
   tmpbody="$(mktemp)"
+  authcfg="$(host_curl_auth_cfg "$token")"
   while :; do
     n=$((n + 1))
-    status="$(curl -sSL -o "$tmpbody" -w '%{http_code}' "$@" "$url" 2>/dev/null || echo "000")"
+    status="$(curl -sSL -o "$tmpbody" -w '%{http_code}' --config "$authcfg" "$@" "$url" 2>/dev/null || echo "000")"
     case "$status" in
-      2*) body="$(cat "$tmpbody")"; rm -f "$tmpbody"; echo "$body"; return 0 ;;
-      4*) rm -f "$tmpbody"; return 1 ;;   # auth / not-found — don't retry
+      2*) cat "$tmpbody"; rm -f "$tmpbody" "$authcfg"; return 0 ;;
+      4*) rm -f "$tmpbody" "$authcfg"; return 1 ;;   # auth / not-found — don't retry
       *)
         if [ "$n" -ge "$attempts" ]; then
-          rm -f "$tmpbody"; return 1
+          rm -f "$tmpbody" "$authcfg"; return 1
         fi
         sleep "$delay"
         ;;
@@ -157,19 +171,20 @@ host_http_get() {
 # Same shape as host_http_get but writes response headers to stdout instead
 # of the body — used by host_gh_pat_scopes to read X-OAuth-Scopes.
 host_http_get_headers() {
-  local url="$1" ; shift
+  local url="$1" token="$2" ; shift 2
   local attempts=3 delay=2 n=0 status
-  local tmpheaders
+  local tmpheaders authcfg
   tmpheaders="$(mktemp)"
+  authcfg="$(host_curl_auth_cfg "$token")"
   while :; do
     n=$((n + 1))
-    status="$(curl -sSL -D "$tmpheaders" -o /dev/null -w '%{http_code}' "$@" "$url" 2>/dev/null || echo "000")"
+    status="$(curl -sSL -D "$tmpheaders" -o /dev/null -w '%{http_code}' --config "$authcfg" "$@" "$url" 2>/dev/null || echo "000")"
     case "$status" in
-      2*) cat "$tmpheaders"; rm -f "$tmpheaders"; return 0 ;;
-      4*) rm -f "$tmpheaders"; return 1 ;;
+      2*) cat "$tmpheaders"; rm -f "$tmpheaders" "$authcfg"; return 0 ;;
+      4*) rm -f "$tmpheaders" "$authcfg"; return 1 ;;
       *)
         if [ "$n" -ge "$attempts" ]; then
-          rm -f "$tmpheaders"; return 1
+          rm -f "$tmpheaders" "$authcfg"; return 1
         fi
         sleep "$delay"
         ;;
@@ -184,7 +199,7 @@ host_doppler_get() {
   local service_token="$1" secret_name="$2" body
   body="$(host_http_get \
     "https://api.doppler.com/v3/configs/config/secret?name=${secret_name}" \
-    -H "Authorization: Bearer ${service_token}" \
+    "$service_token" \
   )" || return 1
   jq -r '.value.computed // empty' <<< "$body"
 }
@@ -196,8 +211,8 @@ host_gh_list_emails() {
   local pat="$1" body
   body="$(host_http_get \
     "https://api.github.com/user/emails" \
+    "$pat" \
     -H "Accept: application/vnd.github+json" \
-    -H "Authorization: Bearer ${pat}" \
   )" || return 1
   jq -r '.[] | select(.verified == true) | .email' <<< "$body"
 }
@@ -209,27 +224,29 @@ host_gh_pat_scopes() {
   local pat="$1"
   host_http_get_headers \
     "https://api.github.com/user" \
+    "$pat" \
     -H "Accept: application/vnd.github+json" \
-    -H "Authorization: Bearer ${pat}" \
     | awk -F': ' 'tolower($1) == "x-oauth-scopes" { sub(/\r$/, "", $2); print $2 }'
 }
 
 # Register an SSH public key on the GH user's account. Treats "already in
 # use" as success. Prints a one-line status to stdout; returns 0/1.
+# Like the GET helpers, the PAT goes through a curl config file so it isn't
+# visible in `ps aux`. The request body (SSH pubkey + title) isn't sensitive.
 host_gh_add_ssh_key() {
   local pat="$1" title="$2" pubkey="$3"
-  local tmpbody status body
+  local tmpbody authcfg status body
   tmpbody="$(mktemp)"
+  authcfg="$(host_curl_auth_cfg "$pat")"
   status="$(
-    retry 3 2 curl -sSL -o "$tmpbody" -w '%{http_code}' \
+    retry 3 2 curl -sSL -o "$tmpbody" -w '%{http_code}' --config "$authcfg" \
       -X POST \
       -H "Accept: application/vnd.github+json" \
-      -H "Authorization: Bearer ${pat}" \
       "https://api.github.com/user/keys" \
       -d "$(jq -n --arg t "$title" --arg k "$pubkey" '{title: $t, key: $k}')"
   )" || status="network-error"
   body="$(cat "$tmpbody")"
-  rm -f "$tmpbody"
+  rm -f "$tmpbody" "$authcfg"
   case "$status" in
     2*) echo "registered"; return 0 ;;
     422)
@@ -608,7 +625,14 @@ for name in "${VM_NAME_ARR[@]}"; do
   fi
 
   if [ -n "$chosen_email" ]; then
-    [[ "$chosen_email" == *@*.* ]] || { echo "ERROR: '$chosen_email' doesn't look like an email for $name"; exit 1; }
+    # Minimal email shape check: non-empty local@domain.tld, no whitespace
+    # or stray @s. Not strict RFC 5322 validation — operators who fat-finger
+    # their own address spot it quickly anyway; this just rejects the
+    # obviously-wrong like '@@..' or 'foo' or 'foo@'.
+    if ! [[ "$chosen_email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+      echo "ERROR: '$chosen_email' doesn't look like an email for $name"
+      exit 1
+    fi
     GIT_USER_EMAILS[$name]="$chosen_email"
 
     name_envvar="GIT_USER_NAME_$(env_suffix "$name")"
@@ -1056,12 +1080,19 @@ inject_gh_auth() {
     return
   fi
 
-  if printf '%s' "$pat" \
-       | incus exec "$name" -- sudo -iu agent bash -c 'gh auth login --with-token && gh config set -h github.com git_protocol ssh' \
-       >/dev/null 2>&1; then
+  # Capture combined stdout+stderr so if gh auth fails (bad PAT, scope
+  # mismatch, network hiccup), the operator sees the real error.
+  local auth_output
+  if auth_output="$(printf '%s' "$pat" \
+       | incus exec "$name" -- sudo -iu agent bash -c 'gh auth login --with-token && gh config set -h github.com git_protocol ssh' 2>&1)"; then
     echo "  $name: gh authenticated (git_protocol=ssh)"
   else
-    echo "  $name: gh auth failed — run 'doppler secrets get $GITHUB_PAT_SECRET_NAME --plain | gh auth login --with-token' manually"
+    echo "  $name: gh auth failed"
+    # Truncate in case gh dumped a long trace.
+    local snippet="${auth_output:0:400}"
+    [ "${#auth_output}" -gt 400 ] && snippet+=" …"
+    echo "    diagnostic: $snippet"
+    echo "    try manually: doppler secrets get $GITHUB_PAT_SECRET_NAME --plain | gh auth login --with-token"
   fi
 }
 
