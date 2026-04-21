@@ -154,37 +154,63 @@ host_http_get() {
   done
 }
 
+# Same shape as host_http_get but writes response headers to stdout instead
+# of the body — used by host_gh_pat_scopes to read X-OAuth-Scopes.
+host_http_get_headers() {
+  local url="$1" ; shift
+  local attempts=3 delay=2 n=0 status
+  local tmpheaders
+  tmpheaders="$(mktemp)"
+  while :; do
+    n=$((n + 1))
+    status="$(curl -sSL -D "$tmpheaders" -o /dev/null -w '%{http_code}' "$@" "$url" 2>/dev/null || echo "000")"
+    case "$status" in
+      2*) cat "$tmpheaders"; rm -f "$tmpheaders"; return 0 ;;
+      4*) rm -f "$tmpheaders"; return 1 ;;
+      *)
+        if [ "$n" -ge "$attempts" ]; then
+          rm -f "$tmpheaders"; return 1
+        fi
+        sleep "$delay"
+        ;;
+    esac
+  done
+}
+
 # Fetch a single Doppler secret by name using a service token.
-# Writes the decrypted value to stdout, empty on any failure.
+# Writes the decrypted value to stdout; returns 1 if the secret can't be
+# resolved (bad token, missing secret, network down after retries).
 host_doppler_get() {
   local service_token="$1" secret_name="$2" body
   body="$(host_http_get \
     "https://api.doppler.com/v3/configs/config/secret?name=${secret_name}" \
     -H "Authorization: Bearer ${service_token}" \
-  )" || return 0
+  )" || return 1
   jq -r '.value.computed // empty' <<< "$body"
 }
 
 # List verified email addresses on the GitHub user the PAT authenticates as,
-# one per line. Empty on failure.
+# one per line. Returns 1 on API error, 0 otherwise (even if the list is
+# empty — that's a valid state).
 host_gh_list_emails() {
   local pat="$1" body
   body="$(host_http_get \
     "https://api.github.com/user/emails" \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${pat}" \
-  )" || return 0
+  )" || return 1
   jq -r '.[] | select(.verified == true) | .email' <<< "$body"
 }
 
-# Return the comma-separated list of OAuth scopes granted to the PAT. Used
-# to warn up-front about missing scopes rather than failing mid-flow.
+# Return the comma-separated list of OAuth scopes granted to the PAT via
+# the X-OAuth-Scopes response header. Empty output if the header isn't
+# present (fine-grained PATs don't expose scopes) OR if the request failed.
 host_gh_pat_scopes() {
   local pat="$1"
-  retry 3 2 curl -sSL --fail -D - -o /dev/null \
+  host_http_get_headers \
+    "https://api.github.com/user" \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${pat}" \
-    "https://api.github.com/user" 2>/dev/null \
     | awk -F': ' 'tolower($1) == "x-oauth-scopes" { sub(/\r$/, "", $2); print $2 }'
 }
 
@@ -490,7 +516,7 @@ if [ -n "$GITHUB_PAT_SECRET_NAME" ]; then
       # Up-front scope check so the user finds out about a bad PAT here,
       # not after plan-confirm. Fine-grained PATs don't expose scopes via
       # X-OAuth-Scopes; classic PATs do. Missing header ≠ missing scope —
-      # treat unknown as "we'll find out at upload time".
+      # print a note so the user knows why the check was skipped.
       scopes="$(host_gh_pat_scopes "$pat" 2>/dev/null || true)"
       if [ -n "$scopes" ]; then
         missing=""
@@ -503,6 +529,8 @@ if [ -n "$GITHUB_PAT_SECRET_NAME" ]; then
           echo "  $name: PAT resolved but missing scope(s): ${missing% }"
           echo "         Granted: ${scopes}"
         fi
+      else
+        echo "  $name: PAT scope check skipped (fine-grained PAT or no X-OAuth-Scopes header) — any missing scopes will surface at upload time"
       fi
 
       emails="$(host_gh_list_emails "$pat" || true)"
@@ -921,10 +949,10 @@ runcmd:
   # bootstrap.sh if a PAT was resolvable via Doppler. If not, authenticate
   # manually inside the container with:
   #   doppler secrets get ${GITHUB_PAT_SECRET_NAME:-GITHUB_TOKEN} --plain | gh auth login --with-token
-  - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+  - bash -c 'for i in 1 2 3; do curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && break; sleep 5; done'
   - chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
   - bash -c 'echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list'
-  - apt-get update -qq
+  - bash -c 'for i in 1 2 3; do apt-get update -qq && break; sleep 5; done'
   - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh
 EOF
 }
