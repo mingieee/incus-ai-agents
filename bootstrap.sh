@@ -1,55 +1,112 @@
 #!/bin/bash
 # Post-login host bootstrap.
-# Run as ops after first SSH login into the newly-rebuilt VPS.
-# Idempotent: safe to re-run.
+# Run as ops (or any incus-admin user) after first SSH login into the
+# newly-rebuilt VPS.
+#
+# Safe to re-run: existing containers aren't recreated, profiles and
+# cloud-init user-data are re-applied at the Incus layer. Note that
+# cloud-init's users/write_files/runcmd modules only execute on first
+# boot of a container, so re-running bootstrap.sh won't re-run those
+# inside existing containers — delete the container (or its cloud-init
+# state) first if you need a full rebuild.
+#
+# Interactive by default. All prompts can be skipped by setting the
+# corresponding env var, which is what makes non-interactive scripted runs
+# work too.
 #
 # Prereqs (all handled by host-cloud-init.yaml):
 #   - incus package installed, daemon running
-#   - ops user in incus-admin group
+#   - current user in incus-admin group
 #   - /etc/subuid + /etc/subgid include root:1000000:1000000000
 #   - UFW configured to trust incusbr0
+#   - ~/.ssh/authorized_keys populated with the key you'll SSH from
 #
-# Optional env vars:
-#   GIT_USER_NAME, GIT_USER_EMAIL   — baked into each container's ~/.gitconfig
-#   DOPPLER_TOKEN_ALPHA             — service token for alpha, scope=/
-#   DOPPLER_TOKEN_BETA              — service token for beta,  scope=/
+# Env vars (all optional — prompted if unset and stdin is a TTY):
+#   SSH_PUBLIC_KEY       — one or more SSH public key lines (newline-separated)
+#                          to install in each container. Default: every valid
+#                          key line in the operator's ~/.ssh/authorized_keys.
+#   VM_COUNT             — number of agent VMs (default: 2)
+#   VM_NAMES             — space-separated names (default: vm1 vm2 ...)
+#   VM_RAM               — space-separated GiB values, same order as VM_NAMES
+#                          (default: equal split of available host RAM)
+#   HOST_RESERVE_GB      — GiB to leave for the host when computing the
+#                          default RAM split (default: 2)
+#   IP_BASE              — last octet of the first VM's IP on incusbr0
+#                          (default: 11; subsequent VMs get base+1, base+2, ...)
+#   GIT_USER_NAME        — baked into each container's ~/.gitconfig
+#   GIT_USER_EMAIL       — baked into each container's ~/.gitconfig
+#   DOPPLER_TOKEN_<NAME> — service token for VM <NAME> (uppercase, hyphens
+#                          become underscores), scope=/
+#   ASSUME_YES=1         — skip the final confirmation prompt
+#   INIT_ONLY=1          — only run `incus admin init --preseed` and exit
+#                          (for the disaster-recovery flow where you want the
+#                          Incus bridge + storage pool in place before running
+#                          ./restore-golden.sh, without creating empty containers)
 #
-# If you see "ops not in incus-admin group": log out and back in, then re-run.
+# If you see "user not in incus-admin group": log out and back in, then re-run.
 
 set -euo pipefail
 
-# -------- Config --------
+# -------- Static config --------
 BRIDGE_NAME="incusbr0"
 BRIDGE_CIDR="10.88.0.1/24"
+BRIDGE_NETWORK="10.88.0"
 STORAGE_POOL="default"
 IMAGE="images:ubuntu/24.04/cloud"
 
-ALPHA_IP="10.88.0.11"
-BETA_IP="10.88.0.12"
-ALPHA_RAM="6GiB"
-BETA_RAM="4GiB"
+DEFAULT_VM_COUNT=2
+DEFAULT_HOST_RESERVE_GB=2
+DEFAULT_IP_BASE=11
 
-AGENT_PUBKEY="$(head -1 ~/.ssh/authorized_keys)"
+# -------- Helpers --------
+is_tty() { [ -t 0 ]; }
 
-GIT_USER_NAME="${GIT_USER_NAME:-}"
-GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
-DOPPLER_TOKEN_ALPHA="${DOPPLER_TOKEN_ALPHA:-}"
-DOPPLER_TOKEN_BETA="${DOPPLER_TOKEN_BETA:-}"
-
-# -------- Sanity checks --------
-echo "==> Checking prerequisites"
-command -v incus >/dev/null || { echo "ERROR: incus not installed"; exit 1; }
-id -nG | tr ' ' '\n' | grep -qx incus-admin || {
-  echo "ERROR: ops not in incus-admin group. Log out and back in, then re-run."
-  exit 1
+# Prompt with a default. If stdin isn't a TTY, just echo the default.
+prompt() {
+  local question="$1" default="${2:-}" reply
+  if ! is_tty; then
+    echo "$default"
+    return
+  fi
+  if [ -n "$default" ]; then
+    read -r -p "$question [$default]: " reply >&2
+    echo "${reply:-$default}"
+  else
+    read -r -p "$question: " reply >&2
+    echo "$reply"
+  fi
 }
-grep -q '^root:1000000:' /etc/subuid || { echo "ERROR: /etc/subuid missing root range"; exit 1; }
-grep -q '^root:1000000:' /etc/subgid || { echo "ERROR: /etc/subgid missing root range"; exit 1; }
-[ -n "$AGENT_PUBKEY" ] || { echo "ERROR: ~/.ssh/authorized_keys is empty"; exit 1; }
 
-# -------- Incus init --------
-if ! incus network show "$BRIDGE_NAME" >/dev/null 2>&1; then
-  echo "==> Initialising Incus"
+# Prompt for a secret (no echo). Returns empty string if not a TTY.
+prompt_secret() {
+  local question="$1" reply
+  if ! is_tty; then
+    echo ""
+    return
+  fi
+  read -r -s -p "$question: " reply >&2
+  echo >&2
+  echo "$reply"
+}
+
+# Convert a VM name to the upper-case suffix we use for env-var lookup.
+# vm-1 -> VM_1, alpha -> ALPHA
+env_suffix() {
+  local s="${1^^}"
+  echo "${s//-/_}"
+}
+
+# True when bridge + storage pool + default profile all exist. That's the
+# minimum state required for the rest of the script (and restore-golden.sh)
+# to work, so "bridge exists" alone isn't enough.
+incus_initialised() {
+  incus network show "$BRIDGE_NAME"   >/dev/null 2>&1 \
+    && incus storage show "$STORAGE_POOL" >/dev/null 2>&1 \
+    && incus profile show default         >/dev/null 2>&1
+}
+
+# Run the idempotent one-shot preseed. Called from INIT_ONLY and the main flow.
+incus_preseed() {
   cat <<EOF | incus admin init --preseed
 config: {}
 networks:
@@ -76,8 +133,237 @@ profiles:
       type: disk
 cluster: null
 EOF
+}
+
+# -------- Sanity checks --------
+echo "==> Checking prerequisites"
+command -v incus >/dev/null || { echo "ERROR: incus not installed"; exit 1; }
+id -nG | tr ' ' '\n' | grep -qx incus-admin || {
+  echo "ERROR: $(id -un) not in incus-admin group. Log out and back in, then re-run."
+  exit 1
+}
+grep -q '^root:1000000:' /etc/subuid || { echo "ERROR: /etc/subuid missing root range"; exit 1; }
+grep -q '^root:1000000:' /etc/subgid || { echo "ERROR: /etc/subgid missing root range"; exit 1; }
+
+# SSH keys to install in each container. By default, pick every valid-looking
+# key line from the operator's authorized_keys (skipping blanks and comments).
+# Override wholesale with SSH_PUBLIC_KEY (one or more key lines, newline-separated).
+SSH_KEY_RE='^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-[^[:space:]]+|sk-(ssh-ed25519|ecdsa-sha2-[^[:space:]]+)@openssh\.com) '
+if [ -n "${SSH_PUBLIC_KEY:-}" ]; then
+  AGENT_PUBKEYS="$SSH_PUBLIC_KEY"
+elif [ -f "$HOME/.ssh/authorized_keys" ]; then
+  AGENT_PUBKEYS="$(grep -E "$SSH_KEY_RE" "$HOME/.ssh/authorized_keys" || true)"
 else
+  echo "ERROR: ~/.ssh/authorized_keys missing and SSH_PUBLIC_KEY not set"
+  exit 1
+fi
+[ -n "$AGENT_PUBKEYS" ] || { echo "ERROR: no valid SSH public keys found; set SSH_PUBLIC_KEY or add one to ~/.ssh/authorized_keys"; exit 1; }
+
+# Build the YAML-list fragment for cloud-init: one "      - <key>" per line.
+AGENT_PUBKEY_YAML=""
+while IFS= read -r key; do
+  [ -z "$key" ] && continue
+  AGENT_PUBKEY_YAML+="      - ${key}"$'\n'
+done <<< "$AGENT_PUBKEYS"
+AGENT_PUBKEY_YAML="${AGENT_PUBKEY_YAML%$'\n'}"
+
+# -------- INIT_ONLY: just initialise Incus and exit --------
+# Used by the restore-from-golden flow: get the bridge + storage pool in place,
+# then hand off to ./restore-golden.sh without creating empty containers that
+# would block the import.
+if [ "${INIT_ONLY:-}" = "1" ]; then
+  if incus_initialised; then
+    echo "==> Incus already initialised (bridge + storage pool + default profile present). You can now run ./restore-golden.sh"
+  else
+    echo "==> Initialising Incus (init-only mode)"
+    incus_preseed
+    echo "==> Incus initialised. You can now run ./restore-golden.sh"
+  fi
+  exit 0
+fi
+
+# -------- VM count --------
+VM_COUNT="${VM_COUNT:-}"
+if [ -z "$VM_COUNT" ]; then
+  VM_COUNT="$(prompt 'How many agent VMs?' "$DEFAULT_VM_COUNT")"
+fi
+[[ "$VM_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: VM_COUNT must be a positive integer (got: '$VM_COUNT')"; exit 1; }
+
+# -------- VM names --------
+# Default to the Greek alphabet in order — doubles as a hint when prompting.
+# If VM_COUNT exceeds 24, overflow falls back to vm25, vm26, ...
+GREEK=(alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu \
+       nu xi omicron pi rho sigma tau upsilon phi chi psi omega)
+DEFAULT_NAMES=()
+for ((i=0; i<VM_COUNT; i++)); do
+  if [ "$i" -lt "${#GREEK[@]}" ]; then
+    DEFAULT_NAMES+=("${GREEK[$i]}")
+  else
+    DEFAULT_NAMES+=("vm$((i+1))")
+  fi
+done
+
+VM_NAMES_INPUT="${VM_NAMES:-}"
+if [ -z "$VM_NAMES_INPUT" ]; then
+  if is_tty; then
+    echo
+    echo "Greek alphabet (for reference — pick whichever letters follow your existing VMs):"
+    for ((i=0; i<${#GREEK[@]}; i++)); do
+      printf "  %2d. %-8s" "$((i+1))" "${GREEK[$i]}"
+      (( (i+1) % 6 == 0 )) && echo
+    done
+    (( ${#GREEK[@]} % 6 == 0 )) || echo
+    echo
+  fi
+  VM_NAMES_INPUT="$(prompt "Names for the $VM_COUNT VM(s), space-separated" "${DEFAULT_NAMES[*]}")"
+fi
+read -ra VM_NAME_ARR <<< "$VM_NAMES_INPUT"
+if [ "${#VM_NAME_ARR[@]}" -ne "$VM_COUNT" ]; then
+  echo "ERROR: VM_COUNT=$VM_COUNT but got ${#VM_NAME_ARR[@]} name(s): ${VM_NAME_ARR[*]}"
+  exit 1
+fi
+for n in "${VM_NAME_ARR[@]}"; do
+  [[ "$n" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] || { echo "ERROR: invalid VM name '$n' (must start with a lowercase letter, end with a letter or digit; only lowercase letters, digits, hyphens in between)"; exit 1; }
+done
+# Check for duplicate names
+if [ "$(printf '%s\n' "${VM_NAME_ARR[@]}" | sort -u | wc -l)" -ne "$VM_COUNT" ]; then
+  echo "ERROR: duplicate VM names in: ${VM_NAME_ARR[*]}"
+  exit 1
+fi
+
+# -------- RAM split --------
+HOST_RESERVE_GB="${HOST_RESERVE_GB:-$DEFAULT_HOST_RESERVE_GB}"
+[[ "$HOST_RESERVE_GB" =~ ^[0-9]+$ ]] || { echo "ERROR: HOST_RESERVE_GB must be a non-negative integer"; exit 1; }
+
+TOTAL_RAM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+TOTAL_RAM_GB=$(( TOTAL_RAM_KB / 1024 / 1024 ))
+AVAILABLE_GB=$(( TOTAL_RAM_GB - HOST_RESERVE_GB ))
+if [ "$AVAILABLE_GB" -lt "$VM_COUNT" ]; then
+  echo "ERROR: only ${AVAILABLE_GB}GiB available after reserving ${HOST_RESERVE_GB}GiB for host — can't fit $VM_COUNT VMs"
+  exit 1
+fi
+DEFAULT_PER_VM_GB=$(( AVAILABLE_GB / VM_COUNT ))
+
+echo
+echo "Host RAM: ${TOTAL_RAM_GB}GiB total, reserving ${HOST_RESERVE_GB}GiB for host = ${AVAILABLE_GB}GiB for VMs"
+echo "Default equal split: ${DEFAULT_PER_VM_GB}GiB per VM"
+
+DEFAULT_RAM_LIST=""
+for ((i=0; i<VM_COUNT; i++)); do
+  DEFAULT_RAM_LIST+="${DEFAULT_PER_VM_GB} "
+done
+DEFAULT_RAM_LIST="${DEFAULT_RAM_LIST% }"
+
+VM_RAM_INPUT="${VM_RAM:-}"
+if [ -z "$VM_RAM_INPUT" ]; then
+  VM_RAM_INPUT="$(prompt "RAM in GiB per VM (in same order as names)" "$DEFAULT_RAM_LIST")"
+fi
+read -ra VM_RAM_ARR <<< "$VM_RAM_INPUT"
+if [ "${#VM_RAM_ARR[@]}" -ne "$VM_COUNT" ]; then
+  echo "ERROR: expected $VM_COUNT RAM values, got ${#VM_RAM_ARR[@]}: ${VM_RAM_ARR[*]}"
+  exit 1
+fi
+TOTAL_REQUESTED=0
+for r in "${VM_RAM_ARR[@]}"; do
+  [[ "$r" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: invalid RAM value '$r' (positive integer GiB)"; exit 1; }
+  TOTAL_REQUESTED=$(( TOTAL_REQUESTED + r ))
+done
+if [ "$TOTAL_REQUESTED" -gt "$AVAILABLE_GB" ]; then
+  echo "WARNING: requested ${TOTAL_REQUESTED}GiB exceeds available ${AVAILABLE_GB}GiB (host has ${TOTAL_RAM_GB}GiB total)"
+  if is_tty && [ "${ASSUME_YES:-}" != "1" ]; then
+    read -r -p "Continue anyway? [y/N]: " answer
+    [[ "$answer" =~ ^[Yy] ]] || exit 1
+  fi
+fi
+
+# -------- Git identity (optional) --------
+# Both or neither: a partial identity won't be written to .gitconfig, so treat
+# it as a config error rather than silently dropping it.
+GIT_USER_NAME="${GIT_USER_NAME-__UNSET__}"
+if [ "$GIT_USER_NAME" = "__UNSET__" ]; then
+  GIT_USER_NAME="$(prompt 'Git user.name for containers (blank to skip)' '')"
+fi
+GIT_USER_EMAIL="${GIT_USER_EMAIL-__UNSET__}"
+if [ "$GIT_USER_EMAIL" = "__UNSET__" ]; then
+  if [ -n "$GIT_USER_NAME" ]; then
+    GIT_USER_EMAIL="$(prompt "Git user.email for $GIT_USER_NAME" '')"
+  else
+    GIT_USER_EMAIL="$(prompt 'Git user.email for containers (blank to skip)' '')"
+  fi
+fi
+if [ -n "$GIT_USER_NAME" ] && [ -z "$GIT_USER_EMAIL" ]; then
+  echo "ERROR: GIT_USER_NAME is set but GIT_USER_EMAIL is empty — provide both or neither."
+  exit 1
+fi
+if [ -z "$GIT_USER_NAME" ] && [ -n "$GIT_USER_EMAIL" ]; then
+  echo "ERROR: GIT_USER_EMAIL is set but GIT_USER_NAME is empty — provide both or neither."
+  exit 1
+fi
+
+# -------- Doppler tokens per VM (optional) --------
+# Tokens are read with no-echo so pasted values don't land on screen / scrollback,
+# and injected via stdin (not command args) so they don't appear in ps / sudo logs.
+# An alternative to env vars: DOPPLER_TOKEN_<NAME>_FILE=/path/to/token (one
+# token per file, chmod 600). Useful for scripted runs without putting the
+# secret in shell history or the environment.
+declare -A DOPPLER_TOKENS=()
+echo
+echo "Doppler service tokens (Enter to skip per VM; input is hidden):"
+for name in "${VM_NAME_ARR[@]}"; do
+  envvar="DOPPLER_TOKEN_$(env_suffix "$name")"
+  filevar="${envvar}_FILE"
+  token=""
+  if [ -n "${!filevar-}" ]; then
+    [ -r "${!filevar}" ] || { echo "ERROR: $filevar=${!filevar} not readable"; exit 1; }
+    token="$(tr -d '\r\n' < "${!filevar}")"
+  elif [ "${!envvar-__UNSET__}" != "__UNSET__" ]; then
+    token="${!envvar}"
+  else
+    token="$(prompt_secret "  Doppler token for $name")"
+  fi
+  DOPPLER_TOKENS[$name]="$token"
+done
+
+# -------- IP allocation --------
+IP_BASE="${IP_BASE:-$DEFAULT_IP_BASE}"
+if ! [[ "$IP_BASE" =~ ^[0-9]+$ ]] || [ "$IP_BASE" -lt 2 ] || [ "$IP_BASE" -gt 254 ]; then
+  echo "ERROR: IP_BASE must be 2..254 (got: '$IP_BASE')"
+  exit 1
+fi
+LAST_OCTET=$(( IP_BASE + VM_COUNT - 1 ))
+[ "$LAST_OCTET" -le 254 ] || { echo "ERROR: IP_BASE=$IP_BASE + VM_COUNT=$VM_COUNT overflows /24"; exit 1; }
+
+declare -A VM_IPS=()
+for ((i=0; i<VM_COUNT; i++)); do
+  VM_IPS[${VM_NAME_ARR[$i]}]="${BRIDGE_NETWORK}.$(( IP_BASE + i ))"
+done
+
+# -------- Plan + confirm --------
+echo
+echo "==> Plan:"
+printf "  %-16s %-8s %-14s %s\n" "NAME" "RAM" "IP" "EXTRAS"
+for ((i=0; i<VM_COUNT; i++)); do
+  n="${VM_NAME_ARR[$i]}"
+  extras=""
+  [ -n "${DOPPLER_TOKENS[$n]}" ] && extras="+Doppler"
+  printf "  %-16s %-8s %-14s %s\n" "$n" "${VM_RAM_ARR[$i]}GiB" "${VM_IPS[$n]}" "$extras"
+done
+if [ -n "$GIT_USER_NAME" ] || [ -n "$GIT_USER_EMAIL" ]; then
+  echo "  Git identity: ${GIT_USER_NAME:-<unset>} <${GIT_USER_EMAIL:-<unset>}>"
+fi
+echo
+
+if is_tty && [ "${ASSUME_YES:-}" != "1" ]; then
+  read -r -p "Proceed? [Y/n]: " answer
+  [[ -z "$answer" || "$answer" =~ ^[Yy] ]] || { echo "Aborted."; exit 0; }
+fi
+
+# -------- Incus init --------
+if incus_initialised; then
   echo "==> Incus already initialised"
+else
+  echo "==> Initialising Incus"
+  incus_preseed
 fi
 
 # -------- Profiles --------
@@ -91,29 +377,22 @@ description: Common configuration for AI agent containers
 devices: {}
 EOF
 
-incus profile show alpha-profile >/dev/null 2>&1 || incus profile create alpha-profile
-incus profile edit alpha-profile <<EOF
+for ((i=0; i<VM_COUNT; i++)); do
+  name="${VM_NAME_ARR[$i]}"
+  ram_gb="${VM_RAM_ARR[$i]}"
+  profile="${name}-profile"
+  incus profile show "$profile" >/dev/null 2>&1 || incus profile create "$profile"
+  incus profile edit "$profile" <<EOF
 config:
   limits.cpu: "2"
-  limits.memory: $ALPHA_RAM
+  limits.memory: ${ram_gb}GiB
   limits.processes: "4096"
   snapshots.schedule: "@daily"
   snapshots.expiry: "7d"
-description: Sizing for alpha (primary agent)
+description: Sizing for $name
 devices: {}
 EOF
-
-incus profile show beta-profile >/dev/null 2>&1 || incus profile create beta-profile
-incus profile edit beta-profile <<EOF
-config:
-  limits.cpu: "2"
-  limits.memory: $BETA_RAM
-  limits.processes: "4096"
-  snapshots.schedule: "@daily"
-  snapshots.expiry: "7d"
-description: Sizing for beta (secondary agent)
-devices: {}
-EOF
+done
 
 # -------- Agent cloud-init user-data --------
 # Baked into every container: SSH, tmux service, tmux config (mouse + OSC 52
@@ -125,7 +404,6 @@ EOF
 AGENT_USER_DATA=$(mktemp)
 trap 'rm -f "$AGENT_USER_DATA"' EXIT
 
-# Build gitconfig content conditionally
 GITCONFIG_CONTENT=""
 if [ -n "$GIT_USER_NAME" ] && [ -n "$GIT_USER_EMAIL" ]; then
   GITCONFIG_CONTENT="[user]
@@ -171,7 +449,7 @@ users:
     shell: /bin/bash
     lock_passwd: true
     ssh_authorized_keys:
-      - $AGENT_PUBKEY
+$AGENT_PUBKEY_YAML
 
 write_files:
   - path: /etc/systemd/system/agent-tmux.service
@@ -217,7 +495,7 @@ runcmd:
 EOF
 
 # -------- Containers --------
-for name in alpha beta; do
+for name in "${VM_NAME_ARR[@]}"; do
   if ! incus info "$name" >/dev/null 2>&1; then
     echo "==> Creating $name"
     incus init "$IMAGE" "$name"
@@ -226,23 +504,24 @@ for name in alpha beta; do
   fi
 done
 
-incus profile assign alpha default,agent-base,alpha-profile
-incus profile assign beta  default,agent-base,beta-profile
+for name in "${VM_NAME_ARR[@]}"; do
+  incus profile assign "$name" "default,agent-base,${name}-profile"
+done
 
 # eth0 IP pin (handle fresh create and re-run)
-for pair in "alpha:$ALPHA_IP" "beta:$BETA_IP"; do
-  name="${pair%:*}"
-  ip="${pair#*:}"
+for name in "${VM_NAME_ARR[@]}"; do
+  ip="${VM_IPS[$name]}"
   incus config device remove "$name" eth0 2>/dev/null || true
   incus config device override "$name" eth0 ipv4.address="$ip"
 done
 
-incus config set alpha cloud-init.user-data - < "$AGENT_USER_DATA"
-incus config set beta  cloud-init.user-data - < "$AGENT_USER_DATA"
+for name in "${VM_NAME_ARR[@]}"; do
+  incus config set "$name" cloud-init.user-data - < "$AGENT_USER_DATA"
+done
 
 # -------- Start + wait --------
 echo "==> Starting containers"
-for name in alpha beta; do
+for name in "${VM_NAME_ARR[@]}"; do
   state=$(incus info "$name" | awk '/^Status:/ {print $2}')
   if [ "$state" = "RUNNING" ]; then
     incus restart "$name"
@@ -252,22 +531,28 @@ for name in alpha beta; do
 done
 
 echo "==> Waiting for cloud-init inside containers (2–4 min — extra packages this time)"
-incus exec alpha -- cloud-init status --wait
-incus exec beta  -- cloud-init status --wait
+for name in "${VM_NAME_ARR[@]}"; do
+  incus exec "$name" -- cloud-init status --wait
+done
 
 # -------- Doppler service token injection (per-container, post-boot) --------
+# Token is piped via stdin end-to-end so it never appears in ps output, the
+# host's shell history, or the container's sudo audit log. Doppler CLI reads
+# the token from stdin when no value is passed on the command line.
 inject_doppler() {
   local name="$1" token="$2"
   if [ -z "$token" ]; then
-    echo "==> Skipping Doppler token for $name (DOPPLER_TOKEN_${name^^} not set)"
+    echo "==> Skipping Doppler token for $name (none provided)"
     return
   fi
   echo "==> Injecting Doppler token for $name"
-  incus exec "$name" -- sudo -iu agent bash -c "echo '$token' | doppler configure set token --scope=/ >/dev/null"
+  printf '%s' "$token" \
+    | incus exec "$name" -- sudo -iu agent sh -c 'doppler configure set token --scope=/ >/dev/null'
 }
 
-inject_doppler alpha "$DOPPLER_TOKEN_ALPHA"
-inject_doppler beta  "$DOPPLER_TOKEN_BETA"
+for name in "${VM_NAME_ARR[@]}"; do
+  inject_doppler "$name" "${DOPPLER_TOKENS[$name]}"
+done
 
 # -------- Verify --------
 echo
@@ -275,8 +560,8 @@ echo "==> Final state"
 incus list
 echo
 echo "==> Service checks"
-for name in alpha beta; do
-  printf "%-8s ssh=%s  agent-tmux=%s\n" \
+for name in "${VM_NAME_ARR[@]}"; do
+  printf "%-16s ssh=%s  agent-tmux=%s\n" \
     "$name" \
     "$(incus exec "$name" -- systemctl is-active ssh)" \
     "$(incus exec "$name" -- systemctl is-active agent-tmux)"
@@ -284,13 +569,14 @@ done
 
 echo
 echo "==> GitHub SSH pubkeys (paste into GitHub → Settings → SSH keys)"
-for name in alpha beta; do
+for name in "${VM_NAME_ARR[@]}"; do
   echo "--- $name ---"
   incus exec "$name" -- cat /home/agent/.ssh/id_ed25519.pub
 done
 
 echo
 echo "Bootstrap complete."
-echo "Connect from your Mac:"
-echo "    ssh alpha     # agent@$ALPHA_IP via bl-host"
-echo "    ssh beta      # agent@$BETA_IP  via bl-host"
+echo "Connect from your client (assuming ProxyJump via the host):"
+for name in "${VM_NAME_ARR[@]}"; do
+  printf "    ssh %-16s # agent@%s\n" "$name" "${VM_IPS[$name]}"
+done
