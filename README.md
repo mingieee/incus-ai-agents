@@ -72,7 +72,7 @@ Env vars:
 |---|---|---|
 | `VM_COUNT` | `2` | Number of VMs. |
 | `VM_NAMES` | `alpha beta gamma …` | Space-separated names; must match `VM_COUNT`. Greek alphabet in order; falls back to `vm25 vm26 …` past 24. |
-| `VM_RAM` | equal split | Space-separated GiB integers, same order as `VM_NAMES`. |
+| `VM_RAM` | equal split | Space-separated GiB values, same order as `VM_NAMES`. Integer or `.5` increments (e.g. `4 4.5`). |
 | `HOST_RESERVE_GB` | `2` | GiB kept for the host when computing default split. |
 | `IP_BASE` | `11` | Last octet of first VM's IP on `incusbr0`. |
 | `GIT_USER_EMAIL_BASE` | unset | Base email. Each VM gets `<local>+<vmname>@<domain>` baked into `~/.gitconfig`. Blank skips git identity entirely. |

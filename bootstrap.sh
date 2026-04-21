@@ -27,8 +27,10 @@
 #                          key line in the operator's ~/.ssh/authorized_keys.
 #   VM_COUNT             — number of agent VMs (default: 2)
 #   VM_NAMES             — space-separated names (default: vm1 vm2 ...)
-#   VM_RAM               — space-separated GiB values, same order as VM_NAMES
-#                          (default: equal split of available host RAM)
+#   VM_RAM               — space-separated GiB values, same order as VM_NAMES.
+#                          Integer or .5 increments (e.g. "4 4.5"). Default:
+#                          equal split of available host RAM, rounded down
+#                          to the nearest 0.5 GiB.
 #   HOST_RESERVE_GB      — GiB to leave for the host when computing the
 #                          default RAM split (default: 2)
 #   IP_BASE              — last octet of the first VM's IP on incusbr0
@@ -242,41 +244,64 @@ fi
 HOST_RESERVE_GB="${HOST_RESERVE_GB:-$DEFAULT_HOST_RESERVE_GB}"
 [[ "$HOST_RESERVE_GB" =~ ^[0-9]+$ ]] || { echo "ERROR: HOST_RESERVE_GB must be a non-negative integer"; exit 1; }
 
+# Work in half-GiB units (512 MiB) internally so users can pass `.5`
+# values (e.g. "4.5 4.5" for a 9 GiB host). Format back to "N" / "N.5"
+# GiB for display.
+format_gib() {
+  local h="$1"
+  if (( h % 2 == 0 )); then
+    printf '%d' $((h / 2))
+  else
+    printf '%d.5' $((h / 2))
+  fi
+}
+
 TOTAL_RAM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
-TOTAL_RAM_GB=$(( TOTAL_RAM_KB / 1024 / 1024 ))
-AVAILABLE_GB=$(( TOTAL_RAM_GB - HOST_RESERVE_GB ))
-if [ "$AVAILABLE_GB" -lt "$VM_COUNT" ]; then
-  echo "ERROR: only ${AVAILABLE_GB}GiB available after reserving ${HOST_RESERVE_GB}GiB for host — can't fit $VM_COUNT VMs"
+TOTAL_RAM_MIB=$(( TOTAL_RAM_KB / 1024 ))
+HOST_RESERVE_MIB=$(( HOST_RESERVE_GB * 1024 ))
+TOTAL_HALF_GIB=$(( TOTAL_RAM_MIB / 512 ))
+AVAILABLE_HALF_GIB=$(( (TOTAL_RAM_MIB - HOST_RESERVE_MIB) / 512 ))
+if [ "$AVAILABLE_HALF_GIB" -lt "$VM_COUNT" ]; then
+  echo "ERROR: only $(format_gib "$AVAILABLE_HALF_GIB")GiB available after reserving ${HOST_RESERVE_GB}GiB for host — can't fit $VM_COUNT VMs at 0.5 GiB minimum each"
   exit 1
 fi
-DEFAULT_PER_VM_GB=$(( AVAILABLE_GB / VM_COUNT ))
+DEFAULT_PER_VM_HALF_GIB=$(( AVAILABLE_HALF_GIB / VM_COUNT ))
 
 echo
-echo "Host RAM: ${TOTAL_RAM_GB}GiB total, reserving ${HOST_RESERVE_GB}GiB for host = ${AVAILABLE_GB}GiB for VMs"
-echo "Default equal split: ${DEFAULT_PER_VM_GB}GiB per VM"
+echo "Host RAM: $(format_gib "$TOTAL_HALF_GIB")GiB total, reserving ${HOST_RESERVE_GB}GiB for host = $(format_gib "$AVAILABLE_HALF_GIB")GiB for VMs"
+echo "Default equal split: $(format_gib "$DEFAULT_PER_VM_HALF_GIB")GiB per VM"
 
 DEFAULT_RAM_LIST=""
 for ((i=0; i<VM_COUNT; i++)); do
-  DEFAULT_RAM_LIST+="${DEFAULT_PER_VM_GB} "
+  DEFAULT_RAM_LIST+="$(format_gib "$DEFAULT_PER_VM_HALF_GIB") "
 done
 DEFAULT_RAM_LIST="${DEFAULT_RAM_LIST% }"
 
 VM_RAM_INPUT="${VM_RAM:-}"
 if [ -z "$VM_RAM_INPUT" ]; then
-  VM_RAM_INPUT="$(prompt "RAM in GiB per VM (in same order as names)" "$DEFAULT_RAM_LIST")"
+  VM_RAM_INPUT="$(prompt "RAM in GiB per VM (integer or .5 increments, same order as names)" "$DEFAULT_RAM_LIST")"
 fi
 read -ra VM_RAM_ARR <<< "$VM_RAM_INPUT"
 if [ "${#VM_RAM_ARR[@]}" -ne "$VM_COUNT" ]; then
   echo "ERROR: expected $VM_COUNT RAM values, got ${#VM_RAM_ARR[@]}: ${VM_RAM_ARR[*]}"
   exit 1
 fi
-TOTAL_REQUESTED=0
+declare -a VM_RAM_HALF_GIB=()
+TOTAL_REQUESTED_HALF_GIB=0
 for r in "${VM_RAM_ARR[@]}"; do
-  [[ "$r" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: invalid RAM value '$r' (positive integer GiB)"; exit 1; }
-  TOTAL_REQUESTED=$(( TOTAL_REQUESTED + r ))
+  [[ "$r" =~ ^[0-9]+(\.5)?$ ]] || { echo "ERROR: invalid RAM value '$r' — must be a positive GiB integer or N.5 (e.g. 4, 4.5, 2.5)"; exit 1; }
+  if [[ "$r" == *.5 ]]; then
+    whole="${r%.5}"
+    half=$(( whole * 2 + 1 ))
+  else
+    half=$(( r * 2 ))
+  fi
+  [ "$half" -ge 1 ] || { echo "ERROR: RAM must be at least 0.5 GiB (got: '$r')"; exit 1; }
+  VM_RAM_HALF_GIB+=("$half")
+  TOTAL_REQUESTED_HALF_GIB=$(( TOTAL_REQUESTED_HALF_GIB + half ))
 done
-if [ "$TOTAL_REQUESTED" -gt "$AVAILABLE_GB" ]; then
-  echo "WARNING: requested ${TOTAL_REQUESTED}GiB exceeds available ${AVAILABLE_GB}GiB (host has ${TOTAL_RAM_GB}GiB total)"
+if [ "$TOTAL_REQUESTED_HALF_GIB" -gt "$AVAILABLE_HALF_GIB" ]; then
+  echo "WARNING: requested $(format_gib "$TOTAL_REQUESTED_HALF_GIB")GiB exceeds available $(format_gib "$AVAILABLE_HALF_GIB")GiB (host has $(format_gib "$TOTAL_HALF_GIB")GiB total)"
   if is_tty && [ "${ASSUME_YES:-}" != "1" ]; then
     read -r -p "Continue anyway? [y/N]: " answer
     [[ "$answer" =~ ^[Yy] ]] || exit 1
@@ -370,7 +395,7 @@ for ((i=0; i<VM_COUNT; i++)); do
   extras=""
   [ -n "${DOPPLER_TOKENS[$n]}" ] && extras+="+Doppler "
   [ -n "${GIT_USER_NAMES[$n]:-}" ] && extras+="+Git "
-  printf "  %-16s %-8s %-14s %s\n" "$n" "${VM_RAM_ARR[$i]}GiB" "${VM_IPS[$n]}" "${extras% }"
+  printf "  %-16s %-8s %-14s %s\n" "$n" "$(format_gib "${VM_RAM_HALF_GIB[$i]}")GiB" "${VM_IPS[$n]}" "${extras% }"
 done
 if [ -n "$GIT_USER_EMAIL_BASE" ]; then
   echo
@@ -411,13 +436,14 @@ EOF
 
 for ((i=0; i<VM_COUNT; i++)); do
   name="${VM_NAME_ARR[$i]}"
-  ram_gb="${VM_RAM_ARR[$i]}"
+  # Incus memory limits accept MiB but not fractional GiB, so pass MiB.
+  ram_mib=$(( VM_RAM_HALF_GIB[i] * 512 ))
   profile="${name}-profile"
   incus profile show "$profile" >/dev/null 2>&1 || incus profile create "$profile"
   incus profile edit "$profile" <<EOF
 config:
   limits.cpu: "2"
-  limits.memory: ${ram_gb}GiB
+  limits.memory: ${ram_mib}MiB
   limits.processes: "4096"
   snapshots.schedule: "@daily"
   snapshots.expiry: "7d"
