@@ -25,6 +25,7 @@ not baked in — keeps rebuilds fast and lets you pick per container.
 2. **SSH in as `ops`**, then log out and back in so the `incus-admin` group
    takes effect.
 3. **Copy and run `bootstrap.sh`**:
+
    ```bash
    scp bootstrap.sh ops@<vps>:~/
    ssh ops@<vps>
@@ -46,6 +47,29 @@ not baked in — keeps rebuilds fast and lets you pick per container.
    It then prints a plan and asks to confirm before building anything.
    IPs are auto-allocated on the `10.88.0.0/24` bridge starting at
    `10.88.0.11` (one per VM).
+4. **GitHub SSH keys** — if the Doppler config pointed at by a VM's service
+   token has a secret matching `GITHUB_PAT_SECRET_NAME` (PAT with
+   `admin:public_key` scope), bootstrap generates an ed25519 keypair on the
+   host for each container, uploads the pubkey to GitHub before ever
+   creating the container, and bakes both keys into the container's
+   cloud-init. For VMs without a PAT, the pubkey is still printed at the
+   end — paste it into GitHub → Settings → SSH keys yourself.
+5. **Install agent CLIs** in each container as needed. Examples:
+
+   ```bash
+   # Claude Code
+   ssh agent@<container-ip>
+   curl -fsSL https://claude.ai/install.sh | bash
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+   # Codex CLI (via npm, user-local prefix)
+   curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+   sudo apt install -y nodejs bubblewrap
+   mkdir -p ~/.npm-global
+   npm config set prefix ~/.npm-global
+   echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
+   npm install -g @openai/codex
+   ```
 
 ### Non-interactive / scripted runs
 
@@ -84,29 +108,6 @@ Env vars:
 | `DOPPLER_TOKEN_<NAME>_FILE` | unset | Alternative: path to a file containing the token. Preferred over the env-var form for scripted runs — keeps the secret out of shell history and `/proc/<pid>/environ`. |
 | `ASSUME_YES` | `0` | Set to `1` to skip the final confirmation prompt. |
 | `INIT_ONLY` | `0` | Set to `1` to run only `incus admin init` and exit, without creating containers. Used by the restore-from-golden flow. |
-
-4. **GitHub SSH keys** — if the Doppler config pointed at by a VM's service
-   token has a secret matching `GITHUB_PAT_SECRET_NAME` (PAT with
-   `admin:public_key` scope), bootstrap generates an ed25519 keypair on the
-   host for each container, uploads the pubkey to GitHub before ever
-   creating the container, and bakes both keys into the container's
-   cloud-init. For VMs without a PAT, the pubkey is still printed at the
-   end — paste it into GitHub → Settings → SSH keys yourself.
-5. **Install agent CLIs** in each container as needed. Examples:
-   ```bash
-   # Claude Code
-   ssh agent@<container-ip>
-   curl -fsSL https://claude.ai/install.sh | bash
-   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-
-   # Codex CLI (via npm, user-local prefix)
-   curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-   sudo apt install -y nodejs bubblewrap
-   mkdir -p ~/.npm-global
-   npm config set prefix ~/.npm-global
-   echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
-   npm install -g @openai/codex
-   ```
 
 ## GitHub PAT via Doppler
 
