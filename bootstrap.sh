@@ -223,7 +223,7 @@ if [ "${#VM_NAME_ARR[@]}" -ne "$VM_COUNT" ]; then
   exit 1
 fi
 for n in "${VM_NAME_ARR[@]}"; do
-  [[ "$n" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "ERROR: invalid VM name '$n' (must start with lowercase letter; only lowercase letters, digits, hyphens)"; exit 1; }
+  [[ "$n" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]] || { echo "ERROR: invalid VM name '$n' (must start with a lowercase letter, end with a letter or digit; only lowercase letters, digits, hyphens in between)"; exit 1; }
 done
 # Check for duplicate names
 if [ "$(printf '%s\n' "${VM_NAME_ARR[@]}" | sort -u | wc -l)" -ne "$VM_COUNT" ]; then

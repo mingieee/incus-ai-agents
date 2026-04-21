@@ -30,6 +30,7 @@ not baked in — keeps rebuilds fast and lets you pick per container.
    ssh ops@<vps>
    ./bootstrap.sh
    ```
+
    The script will prompt for:
    - **Number of VMs** (default: 2)
    - **VM names** (default: Greek alphabet in order — `alpha beta gamma …`)
@@ -149,10 +150,12 @@ shred -u "$HOME"/*.token   # once you've confirmed the containers are healthy
 ## Capturing a known-good state
 
 Once everything is configured the way you like, capture golden exports:
+
 ```bash
 ./export-golden.sh            # all containers with the agent-base profile
 ./export-golden.sh alpha beta # or a specific subset
 ```
+
 This writes timestamped tarballs to `/srv/incus-exports/` and refreshes
 `<name>-golden.tar.gz` as a copy of the latest (real file, not a symlink,
 so off-box backups that flatten symlinks still restore cleanly).
