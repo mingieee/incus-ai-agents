@@ -33,8 +33,15 @@
 #                          default RAM split (default: 2)
 #   IP_BASE              — last octet of the first VM's IP on incusbr0
 #                          (default: 11; subsequent VMs get base+1, base+2, ...)
-#   GIT_USER_NAME        — baked into each container's ~/.gitconfig
-#   GIT_USER_EMAIL       — baked into each container's ~/.gitconfig
+#   GIT_USER_EMAIL_BASE  — base git user.email. Each VM gets its own email
+#                          via plus-addressing: base `you@example.com` →
+#                          `you+alpha@example.com`, `you+beta@example.com`, …
+#                          Leave unset/blank to skip git identity entirely.
+#   GIT_USER_NAME        — default git user.name applied to every VM (used
+#                          as the per-VM prompt default). Blank skips that
+#                          VM unless GIT_USER_NAME_<NAME> is set.
+#   GIT_USER_NAME_<NAME> — per-VM override for user.name (same <NAME> encoding
+#                          as DOPPLER_TOKEN_<NAME>).
 #   DOPPLER_TOKEN_<NAME> — service token for VM <NAME> (uppercase, hyphens
 #                          become underscores), scope=/
 #   ASSUME_YES=1         — skip the final confirmation prompt
@@ -276,28 +283,38 @@ if [ "$TOTAL_REQUESTED" -gt "$AVAILABLE_GB" ]; then
   fi
 fi
 
-# -------- Git identity (optional) --------
-# Both or neither: a partial identity won't be written to .gitconfig, so treat
-# it as a config error rather than silently dropping it.
-GIT_USER_NAME="${GIT_USER_NAME-__UNSET__}"
-if [ "$GIT_USER_NAME" = "__UNSET__" ]; then
-  GIT_USER_NAME="$(prompt 'Git user.name for containers (blank to skip)' '')"
+# -------- Git identity (optional, per-VM via plus-addressing) --------
+# One base email (e.g. you@example.com) gets expanded per VM using
+# plus-addressing: `you+alpha@example.com`, `you+beta@example.com`, etc.
+# user.name is prompted per VM so you can tag commits distinctly if you want.
+# Leave the base blank to skip git identity setup entirely.
+GIT_USER_EMAIL_BASE="${GIT_USER_EMAIL_BASE-__UNSET__}"
+if [ "$GIT_USER_EMAIL_BASE" = "__UNSET__" ]; then
+  GIT_USER_EMAIL_BASE="$(prompt 'Base git user.email (blank to skip git identity)' '')"
 fi
-GIT_USER_EMAIL="${GIT_USER_EMAIL-__UNSET__}"
-if [ "$GIT_USER_EMAIL" = "__UNSET__" ]; then
-  if [ -n "$GIT_USER_NAME" ]; then
-    GIT_USER_EMAIL="$(prompt "Git user.email for $GIT_USER_NAME" '')"
-  else
-    GIT_USER_EMAIL="$(prompt 'Git user.email for containers (blank to skip)' '')"
-  fi
+if [ -n "$GIT_USER_EMAIL_BASE" ]; then
+  [[ "$GIT_USER_EMAIL_BASE" == *@*.* ]] || { echo "ERROR: base email must look like 'user@host.tld' (got: '$GIT_USER_EMAIL_BASE')"; exit 1; }
+  GIT_EMAIL_LOCAL="${GIT_USER_EMAIL_BASE%@*}"
+  GIT_EMAIL_DOMAIN="${GIT_USER_EMAIL_BASE##*@}"
 fi
-if [ -n "$GIT_USER_NAME" ] && [ -z "$GIT_USER_EMAIL" ]; then
-  echo "ERROR: GIT_USER_NAME is set but GIT_USER_EMAIL is empty — provide both or neither."
-  exit 1
-fi
-if [ -z "$GIT_USER_NAME" ] && [ -n "$GIT_USER_EMAIL" ]; then
-  echo "ERROR: GIT_USER_EMAIL is set but GIT_USER_NAME is empty — provide both or neither."
-  exit 1
+
+declare -A GIT_USER_NAMES=()
+declare -A GIT_USER_EMAILS=()
+if [ -n "$GIT_USER_EMAIL_BASE" ]; then
+  echo
+  echo "Git user.name per VM (Enter to skip a VM; email auto-derived as ${GIT_EMAIL_LOCAL}+<vm>@${GIT_EMAIL_DOMAIN}):"
+  for name in "${VM_NAME_ARR[@]}"; do
+    envvar="GIT_USER_NAME_$(env_suffix "$name")"
+    if [ "${!envvar-__UNSET__}" != "__UNSET__" ]; then
+      user_name="${!envvar}"
+    else
+      user_name="$(prompt "  Git user.name for $name" "${GIT_USER_NAME:-}")"
+    fi
+    if [ -n "$user_name" ]; then
+      GIT_USER_NAMES[$name]="$user_name"
+      GIT_USER_EMAILS[$name]="${GIT_EMAIL_LOCAL}+${name}@${GIT_EMAIL_DOMAIN}"
+    fi
+  done
 fi
 
 # -------- Doppler tokens per VM (optional) --------
@@ -345,11 +362,20 @@ printf "  %-16s %-8s %-14s %s\n" "NAME" "RAM" "IP" "EXTRAS"
 for ((i=0; i<VM_COUNT; i++)); do
   n="${VM_NAME_ARR[$i]}"
   extras=""
-  [ -n "${DOPPLER_TOKENS[$n]}" ] && extras="+Doppler"
-  printf "  %-16s %-8s %-14s %s\n" "$n" "${VM_RAM_ARR[$i]}GiB" "${VM_IPS[$n]}" "$extras"
+  [ -n "${DOPPLER_TOKENS[$n]}" ] && extras+="+Doppler "
+  [ -n "${GIT_USER_NAMES[$n]:-}" ] && extras+="+Git "
+  printf "  %-16s %-8s %-14s %s\n" "$n" "${VM_RAM_ARR[$i]}GiB" "${VM_IPS[$n]}" "${extras% }"
 done
-if [ -n "$GIT_USER_NAME" ] || [ -n "$GIT_USER_EMAIL" ]; then
-  echo "  Git identity: ${GIT_USER_NAME:-<unset>} <${GIT_USER_EMAIL:-<unset>}>"
+if [ -n "$GIT_USER_EMAIL_BASE" ]; then
+  echo
+  echo "  Git identities:"
+  for name in "${VM_NAME_ARR[@]}"; do
+    if [ -n "${GIT_USER_NAMES[$name]:-}" ]; then
+      printf "    %-16s %s <%s>\n" "$name" "${GIT_USER_NAMES[$name]}" "${GIT_USER_EMAILS[$name]}"
+    else
+      printf "    %-16s <skipped>\n" "$name"
+    fi
+  done
 fi
 echo
 
@@ -400,22 +426,30 @@ done
 # Per-container Doppler service tokens are injected post-boot (see below).
 # Agent CLIs (Claude Code, Codex, etc.) are installed per-container on demand,
 # not baked in — keeps rebuilds fast and agent choice flexible.
+#
+# Git identity is per-VM (distinct user.name + plus-addressed email), so the
+# user-data is rebuilt for each container rather than shared.
 
 AGENT_USER_DATA=$(mktemp)
 trap 'rm -f "$AGENT_USER_DATA"' EXIT
 
-GITCONFIG_CONTENT=""
-if [ -n "$GIT_USER_NAME" ] && [ -n "$GIT_USER_EMAIL" ]; then
-  GITCONFIG_CONTENT="[user]
-          name = $GIT_USER_NAME
-          email = $GIT_USER_EMAIL
+# Build the user-data YAML for a single VM, writing it to $2.
+write_user_data() {
+  local vm="$1" out="$2"
+  local gitconfig_block=""
+  if [ -n "${GIT_USER_NAMES[$vm]:-}" ]; then
+    # Cloud-init's write_files content is embedded via `content: |` so the
+    # inner lines just need consistent indentation relative to `content:`.
+    gitconfig_block="      [user]
+          name = ${GIT_USER_NAMES[$vm]}
+          email = ${GIT_USER_EMAILS[$vm]}
       [init]
           defaultBranch = main
       [pull]
           rebase = false"
-fi
+  fi
 
-cat > "$AGENT_USER_DATA" <<EOF
+  cat > "$out" <<EOF
 #cloud-config
 package_update: true
 package_upgrade: true
@@ -477,12 +511,23 @@ write_files:
       set -g history-limit 100000
       set -g set-clipboard on
 
+EOF
+
+  # Only emit the .gitconfig file if this VM has an identity configured.
+  # cloud-init will happily write an empty file otherwise, which git treats
+  # as a valid (empty) config — fine, but pointless noise.
+  if [ -n "$gitconfig_block" ]; then
+    cat >> "$out" <<EOF
   - path: /home/agent/.gitconfig
     owner: agent:agent
     permissions: '0644'
     content: |
-      $GITCONFIG_CONTENT
+$gitconfig_block
 
+EOF
+  fi
+
+  cat >> "$out" <<EOF
 runcmd:
   - systemctl enable ssh
   - systemctl restart ssh
@@ -493,6 +538,7 @@ runcmd:
   # Generate an ed25519 key for GitHub if one doesn't exist yet.
   - [sudo, -u, agent, sh, -c, "test -f /home/agent/.ssh/id_ed25519 || ssh-keygen -t ed25519 -f /home/agent/.ssh/id_ed25519 -N '' -C agent@\$(hostname)"]
 EOF
+}
 
 # -------- Containers --------
 for name in "${VM_NAME_ARR[@]}"; do
@@ -516,6 +562,7 @@ for name in "${VM_NAME_ARR[@]}"; do
 done
 
 for name in "${VM_NAME_ARR[@]}"; do
+  write_user_data "$name" "$AGENT_USER_DATA"
   incus config set "$name" cloud-init.user-data - < "$AGENT_USER_DATA"
 done
 
@@ -554,6 +601,98 @@ for name in "${VM_NAME_ARR[@]}"; do
   inject_doppler "$name" "${DOPPLER_TOKENS[$name]}"
 done
 
+# -------- GitHub SSH key registration (post-Doppler, optional) --------
+# For each VM with a Doppler token, read GITHUB_TOKEN from whatever Doppler
+# project/config the service token is scoped to, then use that PAT to upload
+# the container's auto-generated ed25519 pubkey to the GitHub user's account.
+# Installs `gh` CLI on-demand (once per container) so re-runs on existing
+# containers also work. Silently skips VMs where Doppler wasn't configured
+# or GITHUB_TOKEN isn't present.
+#
+# Required PAT scopes: admin:public_key (to add SSH keys) or write:public_key.
+declare -A GH_KEY_REGISTERED=()
+register_github_key() {
+  local vm="$1"
+  if [ -z "${DOPPLER_TOKENS[$vm]}" ]; then
+    echo "==> Skipping GitHub SSH key registration for $vm (no Doppler token)"
+    GH_KEY_REGISTERED[$vm]="skipped"
+    return
+  fi
+  echo "==> Registering $vm's SSH key on GitHub (via Doppler GITHUB_TOKEN)"
+
+  # Run everything inside the container as the agent user so the token never
+  # touches the host. Write output to a tmpfile rather than capturing via
+  # $(...) to keep the heredoc easy to read.
+  local tmpout rc
+  tmpout="$(mktemp)"
+  incus exec "$vm" -- sudo -iu agent bash -s >"$tmpout" 2>&1 <<'INNER'
+set -e
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "  Installing gh CLI (one-time)..."
+  sudo install -d -m 755 /usr/share/keyrings
+  sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+  sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+  arch="$(dpkg --print-architecture)"
+  echo "deb [arch=$arch signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh
+fi
+
+token="$(doppler secrets get GITHUB_TOKEN --plain 2>/dev/null || true)"
+if [ -z "$token" ]; then
+  echo "STATUS=no-token"
+  exit 0
+fi
+
+if ! echo "$token" | gh auth login --with-token 2>/dev/null; then
+  echo "STATUS=auth-failed"
+  exit 0
+fi
+
+if add_output="$(gh ssh-key add /home/agent/.ssh/id_ed25519.pub --title "$(hostname)" 2>&1)"; then
+  echo "STATUS=added"
+elif echo "$add_output" | grep -qiE 'already|key is in use'; then
+  echo "STATUS=exists"
+else
+  echo "STATUS=error"
+  echo "$add_output"
+fi
+INNER
+  rc=$?
+  local output
+  output="$(cat "$tmpout")"
+  rm -f "$tmpout"
+
+  local status="unknown"
+  if [ "$rc" -ne 0 ]; then
+    status="error"
+  elif echo "$output" | grep -q '^STATUS=added$'; then
+    status="added"
+  elif echo "$output" | grep -q '^STATUS=exists$'; then
+    status="exists"
+  elif echo "$output" | grep -q '^STATUS=no-token$'; then
+    status="no-token"
+  elif echo "$output" | grep -q '^STATUS=auth-failed$'; then
+    status="auth-failed"
+  fi
+  GH_KEY_REGISTERED[$vm]="$status"
+
+  case "$status" in
+    added)       echo "  $vm: SSH key uploaded to GitHub" ;;
+    exists)      echo "  $vm: SSH key already on GitHub" ;;
+    no-token)    echo "  $vm: GITHUB_TOKEN not found in Doppler — paste the pubkey manually" ;;
+    auth-failed) echo "  $vm: gh auth login failed — check PAT scopes" ;;
+    *)           echo "  $vm: registration failed"; echo "$output" | sed 's/^/    /' ;;
+  esac
+}
+
+for name in "${VM_NAME_ARR[@]}"; do
+  register_github_key "$name"
+done
+
 # -------- Verify --------
 echo
 echo "==> Final state"
@@ -568,9 +707,17 @@ for name in "${VM_NAME_ARR[@]}"; do
 done
 
 echo
-echo "==> GitHub SSH pubkeys (paste into GitHub → Settings → SSH keys)"
+echo "==> GitHub SSH pubkeys"
 for name in "${VM_NAME_ARR[@]}"; do
-  echo "--- $name ---"
+  status="${GH_KEY_REGISTERED[$name]:-unknown}"
+  case "$status" in
+    added|exists)
+      echo "--- $name (registered on GitHub automatically — no action needed) ---"
+      ;;
+    *)
+      echo "--- $name (paste into GitHub → Settings → SSH keys) ---"
+      ;;
+  esac
   incus exec "$name" -- cat /home/agent/.ssh/id_ed25519.pub
 done
 

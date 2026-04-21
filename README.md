@@ -36,7 +36,10 @@ not baked in — keeps rebuilds fast and lets you pick per container.
    - **VM names** (default: Greek alphabet in order — `alpha beta gamma …`)
    - **RAM per VM in GiB** — default is an equal split of host RAM minus a
      2 GiB reserve for the host itself
-   - **Git user.name / user.email** baked into each container (optional)
+   - **Base git user.email** — one address; each VM gets `you+<vmname>@host`
+     via plus-addressing (optional)
+   - **Git user.name per VM** — prompted individually so each container can
+     tag commits distinctly (optional)
    - **Doppler service token per VM** (optional)
 
    It then prints a plan and asks to confirm before building anything.
@@ -51,11 +54,17 @@ Every prompt has a matching env var, so you can skip the prompts entirely:
 VM_COUNT=3 \
 VM_NAMES="alpha beta gamma" \
 VM_RAM="6 4 4" \
-GIT_USER_NAME="Agent" GIT_USER_EMAIL="you@example.com" \
+GIT_USER_EMAIL_BASE="you@example.com" \
+GIT_USER_NAME_ALPHA="Alpha Agent" \
+GIT_USER_NAME_BETA="Beta Agent" \
+GIT_USER_NAME_GAMMA="Gamma Agent" \
 DOPPLER_TOKEN_ALPHA=... DOPPLER_TOKEN_BETA=... DOPPLER_TOKEN_GAMMA=... \
 ASSUME_YES=1 \
   ./bootstrap.sh
 ```
+
+Each container ends up with its own plus-addressed email
+(`you+alpha@example.com`, `you+beta@example.com`, …) and its own `user.name`.
 
 Env vars:
 
@@ -66,14 +75,20 @@ Env vars:
 | `VM_RAM` | equal split | Space-separated GiB integers, same order as `VM_NAMES`. |
 | `HOST_RESERVE_GB` | `2` | GiB kept for the host when computing default split. |
 | `IP_BASE` | `11` | Last octet of first VM's IP on `incusbr0`. |
-| `GIT_USER_NAME` / `GIT_USER_EMAIL` | unset | Baked into `~/.gitconfig` inside each container. |
+| `GIT_USER_EMAIL_BASE` | unset | Base email. Each VM gets `<local>+<vmname>@<domain>` baked into `~/.gitconfig`. Blank skips git identity entirely. |
+| `GIT_USER_NAME` | unset | Default `user.name` applied to every VM (used as the per-VM prompt default). |
+| `GIT_USER_NAME_<NAME>` | unset | Per-VM override for `user.name`. `<NAME>` is the VM name uppercased, hyphens → underscores (e.g. `vm-1` → `GIT_USER_NAME_VM_1`). |
 | `DOPPLER_TOKEN_<NAME>` | unset | Per-VM service token. `<NAME>` is the VM name uppercased, hyphens replaced with underscores (e.g. `vm-1` → `DOPPLER_TOKEN_VM_1`). |
 | `DOPPLER_TOKEN_<NAME>_FILE` | unset | Alternative: path to a file containing the token. Preferred over the env-var form for scripted runs — keeps the secret out of shell history and `/proc/<pid>/environ`. |
 | `ASSUME_YES` | `0` | Set to `1` to skip the final confirmation prompt. |
 | `INIT_ONLY` | `0` | Set to `1` to run only `incus admin init` and exit, without creating containers. Used by the restore-from-golden flow. |
 
-4. **Add each container's GitHub SSH key** (printed at the end of
-   `bootstrap.sh`) to your GitHub account.
+4. **GitHub SSH keys** — if a container's Doppler config has a `GITHUB_TOKEN`
+   secret (PAT with `admin:public_key` scope), `bootstrap.sh` uploads the
+   auto-generated ed25519 pubkey to your GitHub account automatically and
+   marks it `(registered on GitHub automatically)` in its final output. For
+   any container without that, the pubkey is still printed — paste it into
+   GitHub → Settings → SSH keys yourself.
 5. **Install agent CLIs** in each container as needed. Examples:
    ```bash
    # Claude Code
@@ -89,6 +104,21 @@ Env vars:
    echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
    npm install -g @openai/codex
    ```
+
+## GitHub PAT via Doppler (optional auto-registration)
+
+If the Doppler config pointed at by a container's service token contains a
+`GITHUB_TOKEN` secret (Personal Access Token with `admin:public_key` scope,
+plus whatever else you want for `gh` use inside the container), `bootstrap.sh`
+will, after injecting the Doppler token:
+
+1. Install the `gh` CLI inside the container (once, on-demand).
+2. `gh auth login --with-token` using the PAT read from Doppler.
+3. `gh ssh-key add` the container's generated `id_ed25519.pub` to your GH
+   account, titled after the container's hostname.
+
+Re-runs are safe — if the key is already registered, it's skipped. If the
+secret is missing, the container just drops back to the manual paste flow.
 
 ## Doppler service tokens: persistence & security
 
