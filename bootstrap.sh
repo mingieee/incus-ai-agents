@@ -130,14 +130,38 @@ retry() {
   done
 }
 
+# HTTP-aware fetcher: wraps curl so transient failures retry but auth /
+# not-found responses do NOT (no point waiting 6s to confirm a bad PAT).
+# Writes the response body to stdout; returns 0 on 2xx, 1 otherwise.
+host_http_get() {
+  local url="$1" ; shift  # remaining args are extra curl options (e.g. headers)
+  local attempts=3 delay=2 n=0 body status
+  local tmpbody
+  tmpbody="$(mktemp)"
+  while :; do
+    n=$((n + 1))
+    status="$(curl -sSL -o "$tmpbody" -w '%{http_code}' "$@" "$url" 2>/dev/null || echo "000")"
+    case "$status" in
+      2*) body="$(cat "$tmpbody")"; rm -f "$tmpbody"; echo "$body"; return 0 ;;
+      4*) rm -f "$tmpbody"; return 1 ;;   # auth / not-found — don't retry
+      *)
+        if [ "$n" -ge "$attempts" ]; then
+          rm -f "$tmpbody"; return 1
+        fi
+        sleep "$delay"
+        ;;
+    esac
+  done
+}
+
 # Fetch a single Doppler secret by name using a service token.
 # Writes the decrypted value to stdout, empty on any failure.
 host_doppler_get() {
   local service_token="$1" secret_name="$2" body
-  body="$(retry 3 2 curl -sSL --fail \
-    -H "Authorization: Bearer ${service_token}" \
+  body="$(host_http_get \
     "https://api.doppler.com/v3/configs/config/secret?name=${secret_name}" \
-    2>/dev/null)" || return 0
+    -H "Authorization: Bearer ${service_token}" \
+  )" || return 0
   jq -r '.value.computed // empty' <<< "$body"
 }
 
@@ -145,10 +169,11 @@ host_doppler_get() {
 # one per line. Empty on failure.
 host_gh_list_emails() {
   local pat="$1" body
-  body="$(retry 3 2 curl -sSL --fail \
+  body="$(host_http_get \
+    "https://api.github.com/user/emails" \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${pat}" \
-    "https://api.github.com/user/emails" 2>/dev/null)" || return 0
+  )" || return 0
   jq -r '.[] | select(.verified == true) | .email' <<< "$body"
 }
 
@@ -613,9 +638,9 @@ if [ "$any_identity" = "1" ]; then
   echo "  Git identities:"
   for name in "${VM_NAME_ARR[@]}"; do
     if [ -n "${GIT_USER_NAMES[$name]:-}" ]; then
-      printf "    %-16s %s <%s>\n" "$name" "${GIT_USER_NAMES[$name]}" "${GIT_USER_EMAILS[$name]}"
+      printf "    %-*s %s <%s>\n" "$NAME_W" "$name" "${GIT_USER_NAMES[$name]}" "${GIT_USER_EMAILS[$name]}"
     else
-      printf "    %-16s <skipped>\n" "$name"
+      printf "    %-*s <skipped>\n" "$NAME_W" "$name"
     fi
   done
 fi
@@ -628,9 +653,9 @@ if [ "$any_gh" = "1" ]; then
   echo "  GitHub SSH key registration (via Doppler $GITHUB_PAT_SECRET_NAME):"
   for name in "${VM_NAME_ARR[@]}"; do
     if [ -n "${VM_GITHUB_PATS[$name]:-}" ]; then
-      printf "    %-16s will register pubkey as 'agent@%s'\n" "$name" "$name"
+      printf "    %-*s will register pubkey as 'agent@%s'\n" "$NAME_W" "$name" "$name"
     else
-      printf "    %-16s <manual paste>\n" "$name"
+      printf "    %-*s <manual paste>\n" "$NAME_W" "$name"
     fi
   done
 fi
@@ -659,9 +684,15 @@ done
 # into each VM's cloud-init user-data so the container wakes up with them
 # in place. Existing containers keep their in-container key — we read it
 # back at the end for the final summary.
-SSH_KEY_DIR="$(mktemp -d)"
-chmod 700 "$SSH_KEY_DIR"
-trap 'rm -rf "$SSH_KEY_DIR"' EXIT
+#
+# Everything temporary goes under BOOTSTRAP_TMPDIR (0700) so one trap covers
+# both the keypairs and the per-VM user-data files without the later trap
+# clobbering the earlier one.
+BOOTSTRAP_TMPDIR="$(mktemp -d)"
+chmod 700 "$BOOTSTRAP_TMPDIR"
+trap 'rm -rf "$BOOTSTRAP_TMPDIR"' EXIT
+SSH_KEY_DIR="$BOOTSTRAP_TMPDIR/ssh-keys"
+mkdir -m 700 "$SSH_KEY_DIR"
 
 declare -A VM_SSH_PRIV_B64=()
 declare -A VM_SSH_PUB=()
@@ -762,8 +793,8 @@ done
 # operator's verified GitHub addresses or entered manually), so the user-data
 # is rebuilt for each container rather than shared.
 
-AGENT_USER_DATA=$(mktemp)
-trap 'rm -f "$AGENT_USER_DATA"' EXIT
+# Lives under BOOTSTRAP_TMPDIR so the single trap above cleans it up too.
+AGENT_USER_DATA="$BOOTSTRAP_TMPDIR/agent-user-data.yaml"
 
 # Build the user-data YAML for a single VM, writing it to $2.
 write_user_data() {
@@ -961,8 +992,15 @@ inject_doppler() {
     return
   fi
   echo "==> Injecting Doppler token for $name"
-  printf '%s' "$token" \
-    | incus exec "$name" -- sudo -iu agent sh -c 'doppler configure set token --scope=/ >/dev/null'
+  # Return 0 even on failure so one bad container doesn't abort the loop —
+  # we log the failure instead and the user can see which VMs got Doppler.
+  if printf '%s' "$token" \
+       | incus exec "$name" -- sudo -iu agent sh -c 'doppler configure set token --scope=/ >/dev/null' \
+       2>/dev/null; then
+    return 0
+  fi
+  echo "  $name: Doppler injection failed — check the container is running and 'doppler' is on PATH"
+  return 0
 }
 
 for name in "${VM_NAME_ARR[@]}"; do
