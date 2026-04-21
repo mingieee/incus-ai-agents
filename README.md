@@ -25,6 +25,7 @@ not baked in — keeps rebuilds fast and lets you pick per container.
 2. **SSH in as `ops`**, then log out and back in so the `incus-admin` group
    takes effect.
 3. **Copy and run `bootstrap.sh`**:
+
    ```bash
    scp bootstrap.sh ops@<vps>:~/
    ssh ops@<vps>
@@ -36,45 +37,25 @@ not baked in — keeps rebuilds fast and lets you pick per container.
    - **VM names** (default: Greek alphabet in order — `alpha beta gamma …`)
    - **RAM per VM in GiB** — default is an equal split of host RAM minus a
      2 GiB reserve for the host itself
-   - **Git user.name / user.email** baked into each container (optional)
    - **Doppler service token per VM** (optional)
+   - **GitHub PAT secret name** — which Doppler secret holds your GitHub PAT
+     (default `GITHUB_TOKEN`). Used to auto-register each VM's SSH key on
+     GitHub and pull down your verified emails as identity options.
+   - **Git identity per VM** — pick from a numbered list of your verified
+     GitHub emails or enter a custom one; then a `user.name` per VM
 
    It then prints a plan and asks to confirm before building anything.
    IPs are auto-allocated on the `10.88.0.0/24` bridge starting at
    `10.88.0.11` (one per VM).
-
-### Non-interactive / scripted runs
-
-Every prompt has a matching env var, so you can skip the prompts entirely:
-
-```bash
-VM_COUNT=3 \
-VM_NAMES="alpha beta gamma" \
-VM_RAM="6 4 4" \
-GIT_USER_NAME="Agent" GIT_USER_EMAIL="you@example.com" \
-DOPPLER_TOKEN_ALPHA=... DOPPLER_TOKEN_BETA=... DOPPLER_TOKEN_GAMMA=... \
-ASSUME_YES=1 \
-  ./bootstrap.sh
-```
-
-Env vars:
-
-| Var | Default | Notes |
-|---|---|---|
-| `VM_COUNT` | `2` | Number of VMs. |
-| `VM_NAMES` | `alpha beta gamma …` | Space-separated names; must match `VM_COUNT`. Greek alphabet in order; falls back to `vm25 vm26 …` past 24. |
-| `VM_RAM` | equal split | Space-separated GiB integers, same order as `VM_NAMES`. |
-| `HOST_RESERVE_GB` | `2` | GiB kept for the host when computing default split. |
-| `IP_BASE` | `11` | Last octet of first VM's IP on `incusbr0`. |
-| `GIT_USER_NAME` / `GIT_USER_EMAIL` | unset | Baked into `~/.gitconfig` inside each container. |
-| `DOPPLER_TOKEN_<NAME>` | unset | Per-VM service token. `<NAME>` is the VM name uppercased, hyphens replaced with underscores (e.g. `vm-1` → `DOPPLER_TOKEN_VM_1`). |
-| `DOPPLER_TOKEN_<NAME>_FILE` | unset | Alternative: path to a file containing the token. Preferred over the env-var form for scripted runs — keeps the secret out of shell history and `/proc/<pid>/environ`. |
-| `ASSUME_YES` | `0` | Set to `1` to skip the final confirmation prompt. |
-| `INIT_ONLY` | `0` | Set to `1` to run only `incus admin init` and exit, without creating containers. Used by the restore-from-golden flow. |
-
-4. **Add each container's GitHub SSH key** (printed at the end of
-   `bootstrap.sh`) to your GitHub account.
+4. **GitHub SSH keys** — if the Doppler config pointed at by a VM's service
+   token has a secret matching `GITHUB_PAT_SECRET_NAME` (PAT with
+   `admin:public_key` scope), bootstrap generates an ed25519 keypair on the
+   host for each container, uploads the pubkey to GitHub before ever
+   creating the container, and bakes both keys into the container's
+   cloud-init. For VMs without a PAT, the pubkey is still printed at the
+   end — paste it into GitHub → Settings → SSH keys yourself.
 5. **Install agent CLIs** in each container as needed. Examples:
+
    ```bash
    # Claude Code
    ssh agent@<container-ip>
@@ -89,6 +70,72 @@ Env vars:
    echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
    npm install -g @openai/codex
    ```
+
+### Non-interactive / scripted runs
+
+Every prompt has a matching env var, so you can skip the prompts entirely:
+
+```bash
+VM_COUNT=3 \
+VM_NAMES="alpha beta gamma" \
+VM_RAM="6 4.5 4.5" \
+DOPPLER_TOKEN_ALPHA=... DOPPLER_TOKEN_BETA=... DOPPLER_TOKEN_GAMMA=... \
+GITHUB_PAT_SECRET_NAME=GITHUB_TOKEN \
+GIT_USER_EMAIL_ALPHA="you+alpha@example.com" \
+GIT_USER_EMAIL_BETA="you+beta@example.com" \
+GIT_USER_EMAIL_GAMMA="you+gamma@example.com" \
+GIT_USER_NAME_ALPHA="Alpha Agent" \
+GIT_USER_NAME_BETA="Beta Agent" \
+GIT_USER_NAME_GAMMA="Gamma Agent" \
+ASSUME_YES=1 \
+  ./bootstrap.sh
+```
+
+Env vars:
+
+| Var | Default | Notes |
+|---|---|---|
+| `VM_COUNT` | `2` | Number of VMs. |
+| `VM_NAMES` | `alpha beta gamma …` | Space-separated names; must match `VM_COUNT`. Greek alphabet in order; falls back to `vm25 vm26 …` past 24. |
+| `VM_RAM` | equal split | Space-separated GiB values, same order as `VM_NAMES`. Integer or `.5` increments (e.g. `4 4.5`). |
+| `HOST_RESERVE_GB` | `2` | GiB kept for the host when computing the default split (doesn't cap what you can enter for `VM_RAM`). |
+| `IP_BASE` | `11` | Last octet of first VM's IP on `incusbr0`. |
+| `GITHUB_PAT_SECRET_NAME` | `GITHUB_TOKEN` | Name of the Doppler secret that stores your GitHub PAT. Used to register SSH keys on GitHub and list verified emails. |
+| `GIT_USER_EMAIL_<NAME>` | unset | Per-VM `user.email`. Skips the picker for that VM. Same `<NAME>` encoding as `DOPPLER_TOKEN_<NAME>`. |
+| `GIT_USER_NAME` | unset | Default `user.name` applied to every VM (used as the per-VM prompt default). |
+| `GIT_USER_NAME_<NAME>` | unset | Per-VM override for `user.name`. |
+| `DOPPLER_TOKEN_<NAME>` | unset | Per-VM service token. `<NAME>` is the VM name uppercased, hyphens replaced with underscores (e.g. `vm-1` → `DOPPLER_TOKEN_VM_1`). |
+| `DOPPLER_TOKEN_<NAME>_FILE` | unset | Alternative: path to a file containing the token. Preferred over the env-var form for scripted runs — keeps the secret out of shell history and `/proc/<pid>/environ`. |
+| `ASSUME_YES` | `0` | Set to `1` to skip the final confirmation prompt. |
+| `INIT_ONLY` | `0` | Set to `1` to run only `incus admin init` and exit, without creating containers. Used by the restore-from-golden flow. |
+
+## GitHub PAT via Doppler
+
+Once you've given bootstrap a Doppler service token per VM and a `GITHUB_PAT_SECRET_NAME`:
+
+1. Bootstrap hits the Doppler REST API with each VM's service token and pulls
+   down the PAT stored under that secret name.
+2. With that PAT, it calls the GitHub REST API to list your verified email
+   addresses — these show up as numbered options in the git-identity prompt.
+3. It generates an ed25519 keypair on the host (per VM, in a mode-700 tempdir
+   cleaned up on exit), then uploads each pubkey to your GitHub account
+   titled `agent@<vmname>`. Already-registered keys are treated as success.
+4. The private + public keys are baked into the container's cloud-init so
+   the VM wakes up with them in `/home/agent/.ssh/`.
+
+Additionally, post-boot, bootstrap pipes the same PAT into the container's
+`gh auth login --with-token` (stdin-only, never on command line), so the
+`agent` user can run `gh`, `gh repo clone`, `gh pr`, etc. without an
+interactive login. `git_protocol` is set to `ssh` so git URLs use the
+SSH keys we just registered.
+
+Required PAT scopes:
+- `admin:public_key` — SSH key upload
+- `user:email` — enumerate verified addresses
+- `repo` (or finer-grained repo perms) — so the pre-authenticated `gh`
+  inside each container can do the work you want it to
+
+Re-runs are idempotent — keys already on GitHub are detected, not duplicated.
 
 ## Doppler service tokens: persistence & security
 
