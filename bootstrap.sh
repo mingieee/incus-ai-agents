@@ -22,6 +22,9 @@
 #   - ~/.ssh/authorized_keys populated with the key you'll SSH from
 #
 # Env vars (all optional — prompted if unset and stdin is a TTY):
+#   SSH_PUBLIC_KEY       — one or more SSH public key lines (newline-separated)
+#                          to install in each container. Default: every valid
+#                          key line in the operator's ~/.ssh/authorized_keys.
 #   VM_COUNT             — number of agent VMs (default: 2)
 #   VM_NAMES             — space-separated names (default: vm1 vm2 ...)
 #   VM_RAM               — space-separated GiB values, same order as VM_NAMES
@@ -93,28 +96,18 @@ env_suffix() {
   echo "${s//-/_}"
 }
 
-# -------- Sanity checks --------
-echo "==> Checking prerequisites"
-command -v incus >/dev/null || { echo "ERROR: incus not installed"; exit 1; }
-id -nG | tr ' ' '\n' | grep -qx incus-admin || {
-  echo "ERROR: $(id -un) not in incus-admin group. Log out and back in, then re-run."
-  exit 1
+# True when bridge + storage pool + default profile all exist. That's the
+# minimum state required for the rest of the script (and restore-golden.sh)
+# to work, so "bridge exists" alone isn't enough.
+incus_initialised() {
+  incus network show "$BRIDGE_NAME"   >/dev/null 2>&1 \
+    && incus storage show "$STORAGE_POOL" >/dev/null 2>&1 \
+    && incus profile show default         >/dev/null 2>&1
 }
-grep -q '^root:1000000:' /etc/subuid || { echo "ERROR: /etc/subuid missing root range"; exit 1; }
-grep -q '^root:1000000:' /etc/subgid || { echo "ERROR: /etc/subgid missing root range"; exit 1; }
 
-[ -f "$HOME/.ssh/authorized_keys" ] || { echo "ERROR: ~/.ssh/authorized_keys missing"; exit 1; }
-AGENT_PUBKEY="$(head -1 "$HOME/.ssh/authorized_keys")"
-[ -n "$AGENT_PUBKEY" ] || { echo "ERROR: ~/.ssh/authorized_keys is empty"; exit 1; }
-
-# -------- INIT_ONLY: just initialise Incus and exit --------
-# Used by the restore-from-golden flow: get the bridge + storage pool in place,
-# then hand off to ./restore-golden.sh without creating empty containers that
-# would block the import.
-if [ "${INIT_ONLY:-}" = "1" ]; then
-  if ! incus network show "$BRIDGE_NAME" >/dev/null 2>&1; then
-    echo "==> Initialising Incus (init-only mode)"
-    cat <<EOF | incus admin init --preseed
+# Run the idempotent one-shot preseed. Called from INIT_ONLY and the main flow.
+incus_preseed() {
+  cat <<EOF | incus admin init --preseed
 config: {}
 networks:
 - name: $BRIDGE_NAME
@@ -140,9 +133,51 @@ profiles:
       type: disk
 cluster: null
 EOF
-    echo "==> Incus initialised. You can now run ./restore-golden.sh"
+}
+
+# -------- Sanity checks --------
+echo "==> Checking prerequisites"
+command -v incus >/dev/null || { echo "ERROR: incus not installed"; exit 1; }
+id -nG | tr ' ' '\n' | grep -qx incus-admin || {
+  echo "ERROR: $(id -un) not in incus-admin group. Log out and back in, then re-run."
+  exit 1
+}
+grep -q '^root:1000000:' /etc/subuid || { echo "ERROR: /etc/subuid missing root range"; exit 1; }
+grep -q '^root:1000000:' /etc/subgid || { echo "ERROR: /etc/subgid missing root range"; exit 1; }
+
+# SSH keys to install in each container. By default, pick every valid-looking
+# key line from the operator's authorized_keys (skipping blanks and comments).
+# Override wholesale with SSH_PUBLIC_KEY (one or more key lines, newline-separated).
+SSH_KEY_RE='^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-[^[:space:]]+|sk-(ssh-ed25519|ecdsa-sha2-[^[:space:]]+)@openssh\.com) '
+if [ -n "${SSH_PUBLIC_KEY:-}" ]; then
+  AGENT_PUBKEYS="$SSH_PUBLIC_KEY"
+elif [ -f "$HOME/.ssh/authorized_keys" ]; then
+  AGENT_PUBKEYS="$(grep -E "$SSH_KEY_RE" "$HOME/.ssh/authorized_keys" || true)"
+else
+  echo "ERROR: ~/.ssh/authorized_keys missing and SSH_PUBLIC_KEY not set"
+  exit 1
+fi
+[ -n "$AGENT_PUBKEYS" ] || { echo "ERROR: no valid SSH public keys found; set SSH_PUBLIC_KEY or add one to ~/.ssh/authorized_keys"; exit 1; }
+
+# Build the YAML-list fragment for cloud-init: one "      - <key>" per line.
+AGENT_PUBKEY_YAML=""
+while IFS= read -r key; do
+  [ -z "$key" ] && continue
+  AGENT_PUBKEY_YAML+="      - ${key}"$'\n'
+done <<< "$AGENT_PUBKEYS"
+AGENT_PUBKEY_YAML="${AGENT_PUBKEY_YAML%$'\n'}"
+
+# -------- INIT_ONLY: just initialise Incus and exit --------
+# Used by the restore-from-golden flow: get the bridge + storage pool in place,
+# then hand off to ./restore-golden.sh without creating empty containers that
+# would block the import.
+if [ "${INIT_ONLY:-}" = "1" ]; then
+  if incus_initialised; then
+    echo "==> Incus already initialised (bridge + storage pool + default profile present). You can now run ./restore-golden.sh"
   else
-    echo "==> Incus already initialised. You can now run ./restore-golden.sh"
+    echo "==> Initialising Incus (init-only mode)"
+    incus_preseed
+    echo "==> Incus initialised. You can now run ./restore-golden.sh"
   fi
   exit 0
 fi
@@ -324,36 +359,11 @@ if is_tty && [ "${ASSUME_YES:-}" != "1" ]; then
 fi
 
 # -------- Incus init --------
-if ! incus network show "$BRIDGE_NAME" >/dev/null 2>&1; then
-  echo "==> Initialising Incus"
-  cat <<EOF | incus admin init --preseed
-config: {}
-networks:
-- name: $BRIDGE_NAME
-  type: bridge
-  config:
-    ipv4.address: $BRIDGE_CIDR
-    ipv4.nat: "true"
-    ipv6.address: none
-storage_pools:
-- name: $STORAGE_POOL
-  driver: dir
-profiles:
-- name: default
-  description: Default Incus profile
-  devices:
-    eth0:
-      name: eth0
-      network: $BRIDGE_NAME
-      type: nic
-    root:
-      path: /
-      pool: $STORAGE_POOL
-      type: disk
-cluster: null
-EOF
-else
+if incus_initialised; then
   echo "==> Incus already initialised"
+else
+  echo "==> Initialising Incus"
+  incus_preseed
 fi
 
 # -------- Profiles --------
@@ -439,7 +449,7 @@ users:
     shell: /bin/bash
     lock_passwd: true
     ssh_authorized_keys:
-      - $AGENT_PUBKEY
+$AGENT_PUBKEY_YAML
 
 write_files:
   - path: /etc/systemd/system/agent-tmux.service

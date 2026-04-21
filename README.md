@@ -134,15 +134,16 @@ token in the environment. That keeps it out of shell history and out of
 `/proc/<pid>/environ`:
 
 ```bash
-install -m 600 /dev/stdin /root/alpha.token <<< 'dp.st.prod.xxxxx'
-install -m 600 /dev/stdin /root/beta.token  <<< 'dp.st.prod.yyyyy'
+# Run as the same user you'll run ./bootstrap.sh as (no sudo needed):
+install -m 600 /dev/stdin "$HOME/alpha.token" <<< 'dp.st.prod.xxxxx'
+install -m 600 /dev/stdin "$HOME/beta.token"  <<< 'dp.st.prod.yyyyy'
 
-DOPPLER_TOKEN_ALPHA_FILE=/root/alpha.token \
-DOPPLER_TOKEN_BETA_FILE=/root/beta.token  \
+DOPPLER_TOKEN_ALPHA_FILE="$HOME/alpha.token" \
+DOPPLER_TOKEN_BETA_FILE="$HOME/beta.token"  \
 ASSUME_YES=1 \
   ./bootstrap.sh
 
-shred -u /root/*.token   # once you've confirmed the containers are healthy
+shred -u "$HOME"/*.token   # once you've confirmed the containers are healthy
 ```
 
 ## Capturing a known-good state
