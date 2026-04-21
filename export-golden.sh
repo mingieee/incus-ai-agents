@@ -38,10 +38,11 @@ for name in "${TARGETS[@]}"; do
   echo "==> Exporting $name (this takes a minute, depends on container size)"
   incus export "$name" "$EXPORT_DIR/${name}-${STAMP}.tar.gz"
 
-  # Symlink as the current golden
-  ln -sf "${name}-${STAMP}.tar.gz" "$EXPORT_DIR/${name}-golden.tar.gz"
+  # Copy (not symlink) so off-box backups that flatten symlinks still carry
+  # a usable golden to the new host.
+  cp -f "$EXPORT_DIR/${name}-${STAMP}.tar.gz" "$EXPORT_DIR/${name}-golden.tar.gz"
 
-  echo "==> $name done: $EXPORT_DIR/${name}-golden.tar.gz -> ${name}-${STAMP}.tar.gz"
+  echo "==> $name done: $EXPORT_DIR/${name}-golden.tar.gz (copy of ${name}-${STAMP}.tar.gz)"
 done
 
 echo

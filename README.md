@@ -69,6 +69,7 @@ Env vars:
 | `DOPPLER_TOKEN_<NAME>` | unset | Per-VM service token. `<NAME>` is the VM name uppercased, hyphens replaced with underscores (e.g. `vm-1` → `DOPPLER_TOKEN_VM_1`). |
 | `DOPPLER_TOKEN_<NAME>_FILE` | unset | Alternative: path to a file containing the token. Preferred over the env-var form for scripted runs — keeps the secret out of shell history and `/proc/<pid>/environ`. |
 | `ASSUME_YES` | `0` | Set to `1` to skip the final confirmation prompt. |
+| `INIT_ONLY` | `0` | Set to `1` to run only `incus admin init` and exit, without creating containers. Used by the restore-from-golden flow. |
 
 4. **Add each container's GitHub SSH key** (printed at the end of
    `bootstrap.sh`) to your GitHub account.
@@ -151,8 +152,9 @@ Once everything is configured the way you like, capture golden exports:
 ./export-golden.sh            # all containers with the agent-base profile
 ./export-golden.sh alpha beta # or a specific subset
 ```
-This writes timestamped tarballs to `/srv/incus-exports/` and points
-`<name>-golden.tar.gz` symlinks at the latest.
+This writes timestamped tarballs to `/srv/incus-exports/` and refreshes
+`<name>-golden.tar.gz` as a copy of the latest (real file, not a symlink,
+so off-box backups that flatten symlinks still restore cleanly).
 
 Copy the tarballs off-box (e.g. iCloud, S3, another VPS) for disaster recovery.
 
@@ -160,10 +162,9 @@ Copy the tarballs off-box (e.g. iCloud, S3, another VPS) for disaster recovery.
 
 1. Rebuild VPS (same `host-cloud-init.yaml` flow).
 2. Copy your golden tarballs back to `/srv/incus-exports/`.
-3. Run `bootstrap.sh` once to initialise Incus. If the containers already
-   exist from the tarballs, it'll skip recreating them; if you'd rather
-   just do the Incus init step, extract the `incus admin init --preseed`
-   block and run that.
+3. Run `INIT_ONLY=1 ./bootstrap.sh` — initialises Incus (bridge + storage
+   pool) without creating any containers, so the restore can import them
+   cleanly.
 4. Run `./restore-golden.sh` (or pass specific names).
 
 ## Network

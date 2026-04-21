@@ -1,7 +1,14 @@
 #!/bin/bash
 # Post-login host bootstrap.
 # Run as ops (or any incus-admin user) after first SSH login into the
-# newly-rebuilt VPS. Idempotent: safe to re-run.
+# newly-rebuilt VPS.
+#
+# Safe to re-run: existing containers aren't recreated, profiles and
+# cloud-init user-data are re-applied at the Incus layer. Note that
+# cloud-init's users/write_files/runcmd modules only execute on first
+# boot of a container, so re-running bootstrap.sh won't re-run those
+# inside existing containers — delete the container (or its cloud-init
+# state) first if you need a full rebuild.
 #
 # Interactive by default. All prompts can be skipped by setting the
 # corresponding env var, which is what makes non-interactive scripted runs
@@ -28,6 +35,10 @@
 #   DOPPLER_TOKEN_<NAME> — service token for VM <NAME> (uppercase, hyphens
 #                          become underscores), scope=/
 #   ASSUME_YES=1         — skip the final confirmation prompt
+#   INIT_ONLY=1          — only run `incus admin init --preseed` and exit
+#                          (for the disaster-recovery flow where you want the
+#                          Incus bridge + storage pool in place before running
+#                          ./restore-golden.sh, without creating empty containers)
 #
 # If you see "user not in incus-admin group": log out and back in, then re-run.
 
@@ -95,6 +106,46 @@ grep -q '^root:1000000:' /etc/subgid || { echo "ERROR: /etc/subgid missing root 
 [ -f "$HOME/.ssh/authorized_keys" ] || { echo "ERROR: ~/.ssh/authorized_keys missing"; exit 1; }
 AGENT_PUBKEY="$(head -1 "$HOME/.ssh/authorized_keys")"
 [ -n "$AGENT_PUBKEY" ] || { echo "ERROR: ~/.ssh/authorized_keys is empty"; exit 1; }
+
+# -------- INIT_ONLY: just initialise Incus and exit --------
+# Used by the restore-from-golden flow: get the bridge + storage pool in place,
+# then hand off to ./restore-golden.sh without creating empty containers that
+# would block the import.
+if [ "${INIT_ONLY:-}" = "1" ]; then
+  if ! incus network show "$BRIDGE_NAME" >/dev/null 2>&1; then
+    echo "==> Initialising Incus (init-only mode)"
+    cat <<EOF | incus admin init --preseed
+config: {}
+networks:
+- name: $BRIDGE_NAME
+  type: bridge
+  config:
+    ipv4.address: $BRIDGE_CIDR
+    ipv4.nat: "true"
+    ipv6.address: none
+storage_pools:
+- name: $STORAGE_POOL
+  driver: dir
+profiles:
+- name: default
+  description: Default Incus profile
+  devices:
+    eth0:
+      name: eth0
+      network: $BRIDGE_NAME
+      type: nic
+    root:
+      path: /
+      pool: $STORAGE_POOL
+      type: disk
+cluster: null
+EOF
+    echo "==> Incus initialised. You can now run ./restore-golden.sh"
+  else
+    echo "==> Incus already initialised. You can now run ./restore-golden.sh"
+  fi
+  exit 0
+fi
 
 # -------- VM count --------
 VM_COUNT="${VM_COUNT:-}"
@@ -191,13 +242,27 @@ if [ "$TOTAL_REQUESTED" -gt "$AVAILABLE_GB" ]; then
 fi
 
 # -------- Git identity (optional) --------
+# Both or neither: a partial identity won't be written to .gitconfig, so treat
+# it as a config error rather than silently dropping it.
 GIT_USER_NAME="${GIT_USER_NAME-__UNSET__}"
 if [ "$GIT_USER_NAME" = "__UNSET__" ]; then
   GIT_USER_NAME="$(prompt 'Git user.name for containers (blank to skip)' '')"
 fi
 GIT_USER_EMAIL="${GIT_USER_EMAIL-__UNSET__}"
 if [ "$GIT_USER_EMAIL" = "__UNSET__" ]; then
-  GIT_USER_EMAIL="$(prompt 'Git user.email for containers (blank to skip)' '')"
+  if [ -n "$GIT_USER_NAME" ]; then
+    GIT_USER_EMAIL="$(prompt "Git user.email for $GIT_USER_NAME" '')"
+  else
+    GIT_USER_EMAIL="$(prompt 'Git user.email for containers (blank to skip)' '')"
+  fi
+fi
+if [ -n "$GIT_USER_NAME" ] && [ -z "$GIT_USER_EMAIL" ]; then
+  echo "ERROR: GIT_USER_NAME is set but GIT_USER_EMAIL is empty — provide both or neither."
+  exit 1
+fi
+if [ -z "$GIT_USER_NAME" ] && [ -n "$GIT_USER_EMAIL" ]; then
+  echo "ERROR: GIT_USER_EMAIL is set but GIT_USER_NAME is empty — provide both or neither."
+  exit 1
 fi
 
 # -------- Doppler tokens per VM (optional) --------
