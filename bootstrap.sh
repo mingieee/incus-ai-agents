@@ -26,7 +26,8 @@
 #                          to install in each container. Default: every valid
 #                          key line in the operator's ~/.ssh/authorized_keys.
 #   VM_COUNT             — number of agent VMs (default: 2)
-#   VM_NAMES             — space-separated names (default: vm1 vm2 ...)
+#   VM_NAMES             — space-separated names (default: alpha beta gamma …,
+#                          falling back to vm25 vm26 … past the Greek alphabet)
 #   VM_RAM               — space-separated GiB values, same order as VM_NAMES.
 #                          Integer or .5 increments (e.g. "4 4.5"). Default:
 #                          equal split of available host RAM, rounded down
@@ -114,43 +115,68 @@ env_suffix() {
 # Using curl+jq avoids needing to install doppler/gh CLIs on the host; both
 # are present in host-cloud-init.yaml's package list.
 
+# Retry a command a few times with a short backoff. Each call gets its own
+# output; only the final attempt's exit code is propagated. Used to tolerate
+# transient DNS/proxy/TLS hiccups against api.doppler.com and api.github.com.
+retry() {
+  local attempts="${1:-3}" delay="${2:-2}"
+  shift 2
+  local n=0
+  while :; do
+    n=$((n + 1))
+    if "$@"; then return 0; fi
+    [ "$n" -ge "$attempts" ] && return 1
+    sleep "$delay"
+  done
+}
+
 # Fetch a single Doppler secret by name using a service token.
 # Writes the decrypted value to stdout, empty on any failure.
 host_doppler_get() {
-  local service_token="$1" secret_name="$2"
-  curl -sSL --fail \
+  local service_token="$1" secret_name="$2" body
+  body="$(retry 3 2 curl -sSL --fail \
     -H "Authorization: Bearer ${service_token}" \
     "https://api.doppler.com/v3/configs/config/secret?name=${secret_name}" \
-    2>/dev/null \
-    | jq -r '.value.computed // empty'
+    2>/dev/null)" || return 0
+  jq -r '.value.computed // empty' <<< "$body"
 }
 
 # List verified email addresses on the GitHub user the PAT authenticates as,
 # one per line. Empty on failure.
 host_gh_list_emails() {
-  local pat="$1"
-  curl -sSL --fail \
+  local pat="$1" body
+  body="$(retry 3 2 curl -sSL --fail \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${pat}" \
-    "https://api.github.com/user/emails" 2>/dev/null \
-    | jq -r '.[] | select(.verified == true) | .email'
+    "https://api.github.com/user/emails" 2>/dev/null)" || return 0
+  jq -r '.[] | select(.verified == true) | .email' <<< "$body"
+}
+
+# Return the comma-separated list of OAuth scopes granted to the PAT. Used
+# to warn up-front about missing scopes rather than failing mid-flow.
+host_gh_pat_scopes() {
+  local pat="$1"
+  retry 3 2 curl -sSL --fail -D - -o /dev/null \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${pat}" \
+    "https://api.github.com/user" 2>/dev/null \
+    | awk -F': ' 'tolower($1) == "x-oauth-scopes" { sub(/\r$/, "", $2); print $2 }'
 }
 
 # Register an SSH public key on the GH user's account. Treats "already in
 # use" as success. Prints a one-line status to stdout; returns 0/1.
 host_gh_add_ssh_key() {
   local pat="$1" title="$2" pubkey="$3"
-  local tmpbody status
+  local tmpbody status body
   tmpbody="$(mktemp)"
   status="$(
-    curl -sSL -o "$tmpbody" -w '%{http_code}' \
+    retry 3 2 curl -sSL -o "$tmpbody" -w '%{http_code}' \
       -X POST \
       -H "Accept: application/vnd.github+json" \
       -H "Authorization: Bearer ${pat}" \
       "https://api.github.com/user/keys" \
       -d "$(jq -n --arg t "$title" --arg k "$pubkey" '{title: $t, key: $k}')"
-  )"
-  local body
+  )" || status="network-error"
   body="$(cat "$tmpbody")"
   rm -f "$tmpbody"
   case "$status" in
@@ -162,6 +188,7 @@ host_gh_add_ssh_key() {
       echo "rejected: $(echo "$body" | jq -r '.errors[0].message // .message // "unknown"' 2>/dev/null)"; return 1
       ;;
     401) echo "auth-failed"; return 1 ;;
+    network-error) echo "network-error"; return 1 ;;
     *)   echo "http-$status"; return 1 ;;
   esac
 }
@@ -434,6 +461,25 @@ if [ -n "$GITHUB_PAT_SECRET_NAME" ]; then
         continue
       fi
       VM_GITHUB_PATS[$name]="$pat"
+
+      # Up-front scope check so the user finds out about a bad PAT here,
+      # not after plan-confirm. Fine-grained PATs don't expose scopes via
+      # X-OAuth-Scopes; classic PATs do. Missing header ≠ missing scope —
+      # treat unknown as "we'll find out at upload time".
+      scopes="$(host_gh_pat_scopes "$pat" 2>/dev/null || true)"
+      if [ -n "$scopes" ]; then
+        missing=""
+        for required in admin:public_key user:email repo; do
+          if ! grep -qw "$required" <<< "${scopes//,/ }"; then
+            missing+="$required "
+          fi
+        done
+        if [ -n "$missing" ]; then
+          echo "  $name: PAT resolved but missing scope(s): ${missing% }"
+          echo "         Granted: ${scopes}"
+        fi
+      fi
+
       emails="$(host_gh_list_emails "$pat" || true)"
       if [ -z "$emails" ]; then
         echo "  $name: PAT resolved, but no verified GH emails returned"
@@ -543,15 +589,20 @@ for ((i=0; i<VM_COUNT; i++)); do
 done
 
 # -------- Plan + confirm --------
+# Compute column width for the NAME field so long VM names don't misalign.
+NAME_W=4  # "NAME" header
+for n in "${VM_NAME_ARR[@]}"; do
+  [ "${#n}" -gt "$NAME_W" ] && NAME_W="${#n}"
+done
 echo
 echo "==> Plan:"
-printf "  %-16s %-8s %-14s %s\n" "NAME" "RAM" "IP" "EXTRAS"
+printf "  %-*s %-8s %-14s %s\n" "$NAME_W" "NAME" "RAM" "IP" "EXTRAS"
 for ((i=0; i<VM_COUNT; i++)); do
   n="${VM_NAME_ARR[$i]}"
   extras=""
   [ -n "${DOPPLER_TOKENS[$n]}" ] && extras+="+Doppler "
   [ -n "${GIT_USER_NAMES[$n]:-}" ] && extras+="+Git "
-  printf "  %-16s %-8s %-14s %s\n" "$n" "$(format_gib "${VM_RAM_HALF_GIB[$i]}")GiB" "${VM_IPS[$n]}" "${extras% }"
+  printf "  %-*s %-8s %-14s %s\n" "$NAME_W" "$n" "$(format_gib "${VM_RAM_HALF_GIB[$i]}")GiB" "${VM_IPS[$n]}" "${extras% }"
 done
 any_identity=0
 for name in "${VM_NAME_ARR[@]}"; do
@@ -590,45 +641,78 @@ if is_tty && [ "${ASSUME_YES:-}" != "1" ]; then
   [[ -z "$answer" || "$answer" =~ ^[Yy] ]] || { echo "Aborted."; exit 0; }
 fi
 
-# -------- Pre-generate SSH keys + register with GitHub --------
-# Generate a dedicated ed25519 keypair per VM in a chmod-700 tempdir, upload
-# the pubkeys to GitHub via the resolved PATs, then bake the keys into each
-# VM's cloud-init user-data so the container wakes up with them in place.
+# -------- Detect new vs existing containers --------
+# Re-runs should be idempotent: don't regenerate keys for containers that
+# already exist (their existing key is the one GitHub already knows about).
+declare -A VM_IS_NEW=()
+for name in "${VM_NAME_ARR[@]}"; do
+  if incus info "$name" >/dev/null 2>&1; then
+    VM_IS_NEW[$name]="no"
+  else
+    VM_IS_NEW[$name]="yes"
+  fi
+done
+
+# -------- Pre-generate SSH keys + register with GitHub (new containers only) --------
+# Generate a dedicated ed25519 keypair per NEW VM in a chmod-700 tempdir,
+# upload the pubkeys to GitHub via the resolved PATs, then bake the keys
+# into each VM's cloud-init user-data so the container wakes up with them
+# in place. Existing containers keep their in-container key — we read it
+# back at the end for the final summary.
 SSH_KEY_DIR="$(mktemp -d)"
 chmod 700 "$SSH_KEY_DIR"
 trap 'rm -rf "$SSH_KEY_DIR"' EXIT
 
 declare -A VM_SSH_PRIV_B64=()
 declare -A VM_SSH_PUB=()
-declare -A GH_KEY_REGISTERED=()  # status string per VM; used by final output
+declare -A GH_KEY_REGISTERED=()  # status per VM; used by final output
 
-echo
-echo "==> Generating per-VM ed25519 SSH keypairs"
+any_new=0
 for name in "${VM_NAME_ARR[@]}"; do
-  priv="$SSH_KEY_DIR/$name"
-  ssh-keygen -t ed25519 -f "$priv" -N '' -C "agent@$name" -q
-  VM_SSH_PRIV_B64[$name]="$(base64 -w0 < "$priv")"
-  VM_SSH_PUB[$name]="$(cat "${priv}.pub")"
+  [ "${VM_IS_NEW[$name]}" = "yes" ] && any_new=1 && break
 done
 
-echo "==> Registering pubkeys with GitHub"
-for name in "${VM_NAME_ARR[@]}"; do
-  pat="${VM_GITHUB_PATS[$name]:-}"
-  if [ -z "$pat" ]; then
-    GH_KEY_REGISTERED[$name]="skipped"
-    echo "  $name: no PAT → manual paste needed"
-    continue
-  fi
-  status_line="$(host_gh_add_ssh_key "$pat" "agent@$name" "${VM_SSH_PUB[$name]}")"
-  rc=$?
-  case "$status_line" in
-    registered)         GH_KEY_REGISTERED[$name]="added";    echo "  $name: key uploaded to GitHub" ;;
-    already-registered) GH_KEY_REGISTERED[$name]="exists";   echo "  $name: key already on GitHub" ;;
-    auth-failed)        GH_KEY_REGISTERED[$name]="auth";     echo "  $name: gh auth failed — check PAT scopes" ;;
-    *)                  GH_KEY_REGISTERED[$name]="error";    echo "  $name: registration failed ($status_line)" ;;
-  esac
-  [ "$rc" -eq 0 ] || true
-done
+if [ "$any_new" = "1" ]; then
+  echo
+  echo "==> Generating ed25519 SSH keypairs for new containers"
+  for name in "${VM_NAME_ARR[@]}"; do
+    if [ "${VM_IS_NEW[$name]}" = "no" ]; then
+      GH_KEY_REGISTERED[$name]="existing-container"
+      continue
+    fi
+    priv="$SSH_KEY_DIR/$name"
+    ssh-keygen -t ed25519 -f "$priv" -N '' -C "agent@$name" -q
+    VM_SSH_PRIV_B64[$name]="$(base64 -w0 < "$priv")"
+    VM_SSH_PUB[$name]="$(cat "${priv}.pub")"
+  done
+
+  echo "==> Registering pubkeys with GitHub"
+  for name in "${VM_NAME_ARR[@]}"; do
+    if [ "${VM_IS_NEW[$name]}" = "no" ]; then
+      echo "  $name: container already exists — keeping in-container key"
+      continue
+    fi
+    pat="${VM_GITHUB_PATS[$name]:-}"
+    if [ -z "$pat" ]; then
+      GH_KEY_REGISTERED[$name]="skipped-no-pat"
+      echo "  $name: no PAT → manual paste needed"
+      continue
+    fi
+    status_line="$(host_gh_add_ssh_key "$pat" "agent@$name" "${VM_SSH_PUB[$name]}")"
+    case "$status_line" in
+      registered)         GH_KEY_REGISTERED[$name]="added";        echo "  $name: key uploaded to GitHub" ;;
+      already-registered) GH_KEY_REGISTERED[$name]="exists-on-gh"; echo "  $name: key already on GitHub" ;;
+      auth-failed)        GH_KEY_REGISTERED[$name]="auth-failed";  echo "  $name: gh auth failed — check PAT scopes" ;;
+      *)                  GH_KEY_REGISTERED[$name]="error";        echo "  $name: registration failed ($status_line)" ;;
+    esac
+  done
+else
+  echo
+  echo "==> All containers already exist — skipping SSH keygen / GitHub upload"
+  for name in "${VM_NAME_ARR[@]}"; do
+    GH_KEY_REGISTERED[$name]="existing-container"
+  done
+fi
 
 # -------- Incus init --------
 if incus_initialised; then
@@ -674,8 +758,9 @@ done
 # Agent CLIs (Claude Code, Codex, etc.) are installed per-container on demand,
 # not baked in — keeps rebuilds fast and agent choice flexible.
 #
-# Git identity is per-VM (distinct user.name + plus-addressed email), so the
-# user-data is rebuilt for each container rather than shared.
+# Git identity is per-VM (distinct user.name + user.email — picked from the
+# operator's verified GitHub addresses or entered manually), so the user-data
+# is rebuilt for each container rather than shared.
 
 AGENT_USER_DATA=$(mktemp)
 trap 'rm -f "$AGENT_USER_DATA"' EXIT
@@ -758,6 +843,12 @@ write_files:
       set -g history-limit 100000
       set -g set-clipboard on
 
+EOF
+
+  # Only embed SSH keys if we pre-generated them for this VM (i.e. it's a
+  # fresh container). For existing containers we leave their keys alone.
+  if [ -n "${VM_SSH_PRIV_B64[$vm]:-}" ]; then
+    cat >> "$out" <<EOF
   - path: /home/agent/.ssh/id_ed25519
     owner: agent:agent
     permissions: '0600'
@@ -771,6 +862,7 @@ write_files:
       ${VM_SSH_PUB[$vm]}
 
 EOF
+  fi
 
   # Only emit the .gitconfig file if this VM has an identity configured.
   if [ -n "$gitconfig_block" ]; then
@@ -828,6 +920,11 @@ for name in "${VM_NAME_ARR[@]}"; do
 done
 
 for name in "${VM_NAME_ARR[@]}"; do
+  if [ "${VM_IS_NEW[$name]}" = "no" ]; then
+    # Don't overwrite user-data on existing containers — cloud-init won't
+    # re-run anyway, and the original user-data is what baked their keys in.
+    continue
+  fi
   write_user_data "$name" "$AGENT_USER_DATA"
   incus config set "$name" cloud-init.user-data - < "$AGENT_USER_DATA"
 done
@@ -843,7 +940,7 @@ for name in "${VM_NAME_ARR[@]}"; do
   fi
 done
 
-echo "==> Waiting for cloud-init inside containers (2–4 min — extra packages this time)"
+echo "==> Waiting for cloud-init inside containers (3–6 min on first boot — package install + gh repo fetch)"
 for name in "${VM_NAME_ARR[@]}"; do
   incus exec "$name" -- cloud-init status --wait
 done
@@ -852,6 +949,11 @@ done
 # Token is piped via stdin end-to-end so it never appears in ps output, the
 # host's shell history, or the container's sudo audit log. Doppler CLI reads
 # the token from stdin when no value is passed on the command line.
+#
+# Note: on re-run this overwrites whatever token the container currently has
+# configured. Usually harmless, but if you rotated the service token inside
+# the container manually, re-running bootstrap will revert to whatever you
+# supplied at the prompt.
 inject_doppler() {
   local name="$1" token="$2"
   if [ -z "$token" ]; then
@@ -879,6 +981,15 @@ inject_gh_auth() {
     return
   fi
   echo "==> Authenticating gh CLI in $name"
+
+  # Check gh is actually installed first — runcmd could have failed (apt
+  # repo fetch blip, etc.) and the user deserves a clear error instead of
+  # a mystery "auth failed".
+  if ! incus exec "$name" -- command -v gh >/dev/null 2>&1; then
+    echo "  $name: gh not installed — check /var/log/cloud-init-output.log inside the container"
+    return
+  fi
+
   if printf '%s' "$pat" \
        | incus exec "$name" -- sudo -iu agent bash -c 'gh auth login --with-token && gh config set -h github.com git_protocol ssh' \
        >/dev/null 2>&1; then
@@ -902,8 +1013,8 @@ incus list
 echo
 echo "==> Service checks"
 for name in "${VM_NAME_ARR[@]}"; do
-  printf "%-16s ssh=%s  agent-tmux=%s\n" \
-    "$name" \
+  printf "%-*s ssh=%s  agent-tmux=%s\n" \
+    "$NAME_W" "$name" \
     "$(incus exec "$name" -- systemctl is-active ssh)" \
     "$(incus exec "$name" -- systemctl is-active agent-tmux)"
 done
@@ -911,20 +1022,34 @@ done
 echo
 echo "==> GitHub SSH pubkeys"
 for name in "${VM_NAME_ARR[@]}"; do
+  # For existing containers we didn't pre-generate a key — read it from
+  # inside so the fingerprint/pubkey display still works.
+  if [ -z "${VM_SSH_PUB[$name]:-}" ]; then
+    VM_SSH_PUB[$name]="$(incus exec "$name" -- cat /home/agent/.ssh/id_ed25519.pub 2>/dev/null || echo '(unable to read)')"
+  fi
+  fingerprint="$(ssh-keygen -lf - <<< "${VM_SSH_PUB[$name]}" 2>/dev/null | awk '{print $2}')"
+  [ -z "$fingerprint" ] && fingerprint="(no key)"
+
   status="${GH_KEY_REGISTERED[$name]:-unknown}"
   case "$status" in
-    added)  echo "--- $name (uploaded to GitHub at bootstrap time — no action needed) ---" ;;
-    exists) echo "--- $name (already on GitHub — no action needed) ---" ;;
-    auth|error)
-            echo "--- $name (registration failed: $status — paste into GitHub → Settings → SSH keys) ---" ;;
-    *)      echo "--- $name (no Doppler PAT — paste into GitHub → Settings → SSH keys) ---" ;;
+    added)
+      echo "  $name  $fingerprint  (uploaded to GitHub — no action needed)" ;;
+    exists-on-gh)
+      echo "  $name  $fingerprint  (already on GitHub — no action needed)" ;;
+    existing-container)
+      echo "  $name  $fingerprint  (existing container — key not re-uploaded)" ;;
+    auth-failed|error)
+      echo "  $name  $fingerprint  (registration failed: $status — paste below into GitHub → Settings → SSH keys)"
+      echo "    ${VM_SSH_PUB[$name]}" ;;
+    *)
+      echo "  $name  $fingerprint  (no Doppler PAT — paste below into GitHub → Settings → SSH keys)"
+      echo "    ${VM_SSH_PUB[$name]}" ;;
   esac
-  echo "${VM_SSH_PUB[$name]}"
 done
 
 echo
 echo "Bootstrap complete."
 echo "Connect from your client (assuming ProxyJump via the host):"
 for name in "${VM_NAME_ARR[@]}"; do
-  printf "    ssh %-16s # agent@%s\n" "$name" "${VM_IPS[$name]}"
+  printf "    ssh %-*s # agent@%s\n" "$NAME_W" "$name" "${VM_IPS[$name]}"
 done

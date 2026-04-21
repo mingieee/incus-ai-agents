@@ -74,7 +74,7 @@ Env vars:
 | `VM_COUNT` | `2` | Number of VMs. |
 | `VM_NAMES` | `alpha beta gamma …` | Space-separated names; must match `VM_COUNT`. Greek alphabet in order; falls back to `vm25 vm26 …` past 24. |
 | `VM_RAM` | equal split | Space-separated GiB values, same order as `VM_NAMES`. Integer or `.5` increments (e.g. `4 4.5`). |
-| `HOST_RESERVE_GB` | `2` | GiB kept for the host when computing default split. |
+| `HOST_RESERVE_GB` | `2` | GiB kept for the host when computing the default split (doesn't cap what you can enter for `VM_RAM`). |
 | `IP_BASE` | `11` | Last octet of first VM's IP on `incusbr0`. |
 | `GITHUB_PAT_SECRET_NAME` | `GITHUB_TOKEN` | Name of the Doppler secret that stores your GitHub PAT. Used to register SSH keys on GitHub and list verified emails. |
 | `GIT_USER_EMAIL_<NAME>` | unset | Per-VM `user.email`. Skips the picker for that VM. Same `<NAME>` encoding as `DOPPLER_TOKEN_<NAME>`. |
