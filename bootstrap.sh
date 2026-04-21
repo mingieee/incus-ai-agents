@@ -978,7 +978,7 @@ runcmd:
   # unreliable keyserver.ubuntu.com). curl's own --retry handles transient
   # network failure; pipefail ensures a curl miss propagates through the
   # pipe to gpg instead of getting masked.
-  - bash -c 'set -eo pipefail; curl -fsSL --retry 3 --retry-delay 5 https://packages.doppler.com/public/cli/gpg.key | gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg'
+  - bash -c 'set -eo pipefail; curl -fsSL --retry 3 --retry-delay 5 https://packages.doppler.com/public/cli/gpg.key | gpg --batch --yes --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg'
   - chmod go+r /usr/share/keyrings/doppler-archive-keyring.gpg
   - bash -c 'echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" > /etc/apt/sources.list.d/doppler-cli.list'
   # GitHub CLI — pre-authenticated post-boot by bootstrap.sh if a PAT was
