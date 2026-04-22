@@ -87,5 +87,14 @@ exec doppler run -- opencode "$@"
 SH
 chmod +x "$LAUNCHER"
 
+# --- Post-install guidance ------------------------------------------------
+
+# The PATH line we appended to ~/.bashrc only takes effect in *new* shells.
+# If this script was run via `curl … | bash` in an existing session, that
+# session's PATH still doesn't know about ~/.local/bin, so plain `oc` won't
+# resolve. Give the user both options unconditionally.
 echo
-echo "Done. Launch opencode with:  oc"
+echo "Done. Launch opencode with one of:"
+echo "  $LAUNCHER          # works in this shell right now"
+echo "  source ~/.bashrc && oc      # reloads PATH, then 'oc' works in this shell"
+echo "  # any new shell (fresh ssh / tmux window) resolves 'oc' automatically"
