@@ -248,8 +248,19 @@ The script:
 
 ### Launch
 
+Interactive session (normal use):
+
 ```bash
-ssh agent@gamma -- oc
+ssh agent@gamma
+# then, inside the container:
+oc
+```
+
+One-shot from the host (non-interactive SSH won't resolve `~/.local/bin`
+via `.bashrc`, so call the launcher by its full path):
+
+```bash
+ssh agent@gamma "$HOME/.local/bin/oc"
 ```
 
 ### What the configs pin

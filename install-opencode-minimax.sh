@@ -33,13 +33,15 @@ fi
 
 # --- Install --------------------------------------------------------------
 
-if ! command -v opencode >/dev/null; then
-  curl -fsSL https://opencode.ai/install | bash
-fi
-
+# Put opencode's install target on PATH *before* the existence check so we
+# don't reinstall when it's already there but PATH hasn't been reloaded yet.
 grep -q 'opencode/bin' "$HOME/.bashrc" || echo 'export PATH="$HOME/.opencode/bin:$PATH"' >> "$HOME/.bashrc"
 grep -q '.local/bin'   "$HOME/.bashrc" || echo 'export PATH="$HOME/.local/bin:$PATH"'   >> "$HOME/.bashrc"
 export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+
+if ! command -v opencode >/dev/null; then
+  curl -fsSL https://opencode.ai/install | bash
+fi
 
 opencode --version
 
