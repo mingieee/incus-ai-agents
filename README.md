@@ -16,6 +16,8 @@ not baked in — keeps rebuilds fast and lets you pick per container.
 - `bootstrap.sh` — Interactive post-login Incus setup on the host
 - `export-golden.sh` — Snapshot + export every agent container as tarballs
 - `restore-golden.sh` — Recreate containers from golden tarballs
+- `install-opencode-minimax.sh` — Install opencode + MiniMax Coding Plan config on a container
+- `install-opencode-byteplus.sh` — Install opencode + BytePlus ModelArk Coding Plan config on a container
 
 ## First-time setup
 
@@ -69,6 +71,12 @@ not baked in — keeps rebuilds fast and lets you pick per container.
    npm config set prefix ~/.npm-global
    echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
    npm install -g @openai/codex
+
+   # opencode — MiniMax Coding Plan (see "opencode" section below)
+   ssh agent@<container> 'bash -s' < install-opencode-minimax.sh
+
+   # opencode — BytePlus ModelArk Coding Plan
+   ssh agent@<container> 'bash -s' < install-opencode-byteplus.sh
    ```
 
 ### Non-interactive / scripted runs
@@ -193,6 +201,87 @@ ASSUME_YES=1 \
 
 shred -u "$HOME"/*.token   # once you've confirmed the containers are healthy
 ```
+
+## opencode (MiniMax / BytePlus Coding Plans)
+
+`install-opencode-minimax.sh` and `install-opencode-byteplus.sh` set up the
+[opencode](https://opencode.ai) TUI on a container and wire it to a single
+coding-plan provider. They assume the container already has Doppler
+configured (by `bootstrap.sh`) and the shared Doppler project contains the
+right API key.
+
+### Prerequisites — Doppler secret names
+
+Add the **coding-plan** key (not the general API key) to your shared
+Doppler project:
+
+| VM role | Doppler secret name | Source |
+|---|---|---|
+| MiniMax Coding Plan | `MINIMAX_CODING_PLAN_API_KEY` | platform.minimax.io → API Keys → *Create Token Plan Key* (or your Highspeed plan's key slot) |
+| BytePlus Coding Plan | `BYTEPLUS_ARK_CODING_API_KEY` | console.byteplus.com → ModelArk → Coding Plan |
+
+Each provider sells **two separate API keys**: a general Pay-as-you-go key
+and a Coding-Plan key. They draw from different quota pools. Using the
+wrong one yields a misleading `"insufficient balance"` error (Minimax
+returns error code **1008**) even though the key authenticates — see
+Troubleshooting below.
+
+### Install
+
+Per container, run one of the scripts from the host:
+
+```bash
+ssh agent@gamma 'bash -s' < install-opencode-minimax.sh
+ssh agent@delta 'bash -s' < install-opencode-byteplus.sh
+```
+
+The script:
+
+1. Verifies `doppler` is present and the required secret exists (fails
+   fast if not).
+2. Installs opencode via the official one-liner (`opencode.ai/install`).
+3. Writes `~/.config/opencode/opencode.json` with the provider wired to
+   the right Doppler secret via opencode's `{env:VAR}` substitution —
+   no key ever lands on disk.
+4. Writes a short `~/.local/bin/oc` launcher that runs opencode under
+   `doppler run`, so the key arrives as an env var at launch time only.
+
+### Launch
+
+```bash
+ssh agent@gamma -- oc
+```
+
+### What the configs pin
+
+- **model** pinned per provider → no picker on every launch
+  (`minimax/MiniMax-M2.7-highspeed` on Gamma, `byteplus/ark-code-latest`
+  on Delta — the latter auto-selects whichever BytePlus model is
+  currently best for coding).
+- **autoupdate: true** → opencode self-updates.
+- **share: "manual"** → sessions aren't auto-published to opencode.ai.
+- **Kimi-K2.5** (BytePlus) has `"thinking": { "type": "enabled" }` so
+  Ctrl+P → "Show thinking" surfaces the reasoning trace.
+
+### Troubleshooting
+
+**HTTP 500 with `"insufficient balance (1008)"` from MiniMax.** Your
+`MINIMAX_CODING_PLAN_API_KEY` is almost certainly pointing at a general
+Pay-as-you-go key. Auth is succeeding; the key just doesn't have access
+to the coding-plan quota pool. Regenerate specifically from the Coding
+Plan / Token Plan section of the Minimax console and update the secret.
+
+**`oc` says the endpoint is Anthropic's, not MiniMax's.** Something in
+the shell has set `ANTHROPIC_BASE_URL` or `ANTHROPIC_AUTH_TOKEN`. The
+launcher unsets both, but if you're invoking `opencode` directly
+without `oc`, those env vars hijack the config's `baseURL`. Always
+launch via `oc`, or add the `unset` to your shell startup.
+
+**`doppler run` says the secret is missing.** The Doppler service
+token on the container is scoped to a different project than the one
+holding the key. Re-run `bootstrap.sh` on that container with a valid
+service token for the shared project, or `doppler configure set token`
+manually.
 
 ## Capturing a known-good state
 
